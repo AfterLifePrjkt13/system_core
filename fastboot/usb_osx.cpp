@@ -61,51 +61,52 @@ struct usb_handle
 
     UInt8 bulkIn;
     UInt8 bulkOut;
-    IOUSBInterfaceInterface190 **interface;
+    IOUSBInterfaceInterface500** interface;
     unsigned int zero_mask;
 };
 
-class OsxUsbTransport : public Transport {
+class OsxUsbTransport : public UsbTransport {
   public:
-    OsxUsbTransport(std::unique_ptr<usb_handle> handle) : handle_(std::move(handle)) {}
-    ~OsxUsbTransport() override = default;
+    // A timeout of 0 is blocking
+    OsxUsbTransport(std::unique_ptr<usb_handle> handle, uint32_t ms_timeout = 0)
+        : handle_(std::move(handle)), ms_timeout_(ms_timeout) {}
+    ~OsxUsbTransport() override;
 
     ssize_t Read(void* data, size_t len) override;
     ssize_t Write(const void* data, size_t len) override;
     int Close() override;
+    int Reset() override;
 
   private:
     std::unique_ptr<usb_handle> handle_;
+    const uint32_t ms_timeout_;
 
     DISALLOW_COPY_AND_ASSIGN(OsxUsbTransport);
 };
 
 /** Try out all the interfaces and see if there's a match. Returns 0 on
  * success, -1 on failure. */
-static int try_interfaces(IOUSBDeviceInterface182 **dev, usb_handle *handle) {
+static int try_interfaces(IOUSBDeviceInterface500** dev, usb_handle* handle) {
     IOReturn kr;
     IOUSBFindInterfaceRequest request;
     io_iterator_t iterator;
     io_service_t usbInterface;
     IOCFPlugInInterface **plugInInterface;
-    IOUSBInterfaceInterface190 **interface = NULL;
+    IOUSBInterfaceInterface500** interface = NULL;
     HRESULT result;
     SInt32 score;
     UInt8 interfaceNumEndpoints;
 
-    // Placing the constant KIOUSBFindInterfaceDontCare into the following
-    // fields of the IOUSBFindInterfaceRequest structure will allow us to
-    // find all of the interfaces
-    request.bInterfaceClass = kIOUSBFindInterfaceDontCare;
-    request.bInterfaceSubClass = kIOUSBFindInterfaceDontCare;
-    request.bInterfaceProtocol = kIOUSBFindInterfaceDontCare;
+    request.bInterfaceClass = 0xff;
+    request.bInterfaceSubClass = 0x42;
+    request.bInterfaceProtocol = 0x03;
     request.bAlternateSetting = kIOUSBFindInterfaceDontCare;
 
     // Get an iterator for the interfaces on the device
     kr = (*dev)->CreateInterfaceIterator(dev, &request, &iterator);
 
     if (kr != 0) {
-        ERR("Couldn't create a device interface iterator: (%08x)\n", kr);
+        WARN("Couldn't create a device interface iterator: (%08x)\n", kr);
         return -1;
     }
 
@@ -127,10 +128,10 @@ static int try_interfaces(IOUSBDeviceInterface182 **dev, usb_handle *handle) {
         }
 
         // Now create the interface interface for the interface
-        result = (*plugInInterface)->QueryInterface(
-                plugInInterface,
-                CFUUIDGetUUIDBytes(kIOUSBInterfaceInterfaceID),
-                (LPVOID*) &interface);
+        result = (*plugInInterface)
+                         ->QueryInterface(plugInInterface,
+                                          CFUUIDGetUUIDBytes(kIOUSBInterfaceInterfaceID500),
+                                          (LPVOID*)&interface);
 
         // No longer need the intermediate plugin
         (*plugInInterface)->Release(plugInInterface);
@@ -269,7 +270,7 @@ next_interface:
 static int try_device(io_service_t device, usb_handle *handle) {
     kern_return_t kr;
     IOCFPlugInInterface **plugin = NULL;
-    IOUSBDeviceInterface182 **dev = NULL;
+    IOUSBDeviceInterface500** dev = NULL;
     SInt32 score;
     HRESULT result;
     UInt8 serialIndex;
@@ -282,13 +283,12 @@ static int try_device(io_service_t device, usb_handle *handle) {
             &plugin, &score);
 
     if ((kr != 0) || (plugin == NULL)) {
-        ERR("Unable to create a plug-in (%08x)\n", kr);
         goto error;
     }
 
     // Now create the device interface.
-    result = (*plugin)->QueryInterface(plugin,
-            CFUUIDGetUUIDBytes(kIOUSBDeviceInterfaceID), (LPVOID*) &dev);
+    result = (*plugin)->QueryInterface(plugin, CFUUIDGetUUIDBytes(kIOUSBDeviceInterfaceID500),
+                                       (LPVOID*)&dev);
     if ((result != 0) || (dev == NULL)) {
         ERR("Couldn't create a device interface (%08x)\n", (int) result);
         goto error;
@@ -368,6 +368,7 @@ static int try_device(io_service_t device, usb_handle *handle) {
         // device has no serial number
         handle->info.serial_number[0] = 0;
     }
+    handle->info.interface[0] = 0;
     handle->info.writable = 1;
 
     if (try_interfaces(dev, handle)) {
@@ -436,8 +437,7 @@ static int init_usb(ifc_match_func callback, std::unique_ptr<usb_handle>* handle
 
         if (try_device(device, &h) != 0) {
             IOObjectRelease(device);
-            ret = -1;
-            break;
+            continue;
         }
 
         if (h.success) {
@@ -461,7 +461,7 @@ static int init_usb(ifc_match_func callback, std::unique_ptr<usb_handle>* handle
  * Definitions of this file's public functions.
  */
 
-Transport* usb_open(ifc_match_func callback) {
+UsbTransport* usb_open(ifc_match_func callback, uint32_t timeout_ms) {
     std::unique_ptr<usb_handle> handle;
 
     if (init_usb(callback, &handle) < 0) {
@@ -469,12 +469,29 @@ Transport* usb_open(ifc_match_func callback) {
         return nullptr;
     }
 
-    return new OsxUsbTransport(std::move(handle));
+    return new OsxUsbTransport(std::move(handle), timeout_ms);
+}
+
+OsxUsbTransport::~OsxUsbTransport() {
+    Close();
 }
 
 int OsxUsbTransport::Close() {
     /* TODO: Something better here? */
     return 0;
+}
+
+/*
+  TODO: this SHOULD be easy to do with ResetDevice() from IOUSBDeviceInterface.
+  However to perform operations that manipulate the state of the device, you must
+  claim ownership of the device with USBDeviceOpenSeize(). However, this operation
+  always fails with kIOReturnExclusiveAccess.
+  It seems that the kext com.apple.driver.usb.AppleUSBHostCompositeDevice
+  always loads and claims ownership of the device and refuses to give it up.
+*/
+int OsxUsbTransport::Reset() {
+    ERR("USB reset is currently unsupported on osx\n");
+    return -1;
 }
 
 ssize_t OsxUsbTransport::Read(void* data, size_t len) {
@@ -499,7 +516,14 @@ ssize_t OsxUsbTransport::Read(void* data, size_t len) {
         return -1;
     }
 
-    result = (*handle_->interface)->ReadPipe(handle_->interface, handle_->bulkIn, data, &numBytes);
+    if (!ms_timeout_) {
+        result = (*handle_->interface)
+                         ->ReadPipe(handle_->interface, handle_->bulkIn, data, &numBytes);
+    } else {
+        result = (*handle_->interface)
+                         ->ReadPipeTO(handle_->interface, handle_->bulkIn, data, &numBytes,
+                                      ms_timeout_, ms_timeout_);
+    }
 
     if (result == 0) {
         return (int) numBytes;
@@ -546,8 +570,16 @@ ssize_t OsxUsbTransport::Write(const void* data, size_t len) {
         int lenToSend = lenRemaining > maxLenToSend
             ? maxLenToSend : lenRemaining;
 
-        result = (*handle_->interface)->WritePipe(
-                handle_->interface, handle_->bulkOut, (void *)data, lenToSend);
+        if (!ms_timeout_) {  // blocking
+            result = (*handle_->interface)
+                             ->WritePipe(handle_->interface, handle_->bulkOut, (void*)data,
+                                         lenToSend);
+        } else {
+            result = (*handle_->interface)
+                             ->WritePipeTO(handle_->interface, handle_->bulkOut, (void*)data,
+                                           lenToSend, ms_timeout_, ms_timeout_);
+        }
+
         if (result != 0) break;
 
         lenRemaining -= lenToSend;

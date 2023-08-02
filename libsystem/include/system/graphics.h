@@ -25,6 +25,7 @@
  * generated.
  */
 #include "graphics-base.h"
+#include "graphics-sw.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -32,8 +33,6 @@ extern "C" {
 
 /* for compatibility */
 #define HAL_PIXEL_FORMAT_YCbCr_420_888 HAL_PIXEL_FORMAT_YCBCR_420_888
-#define HAL_PIXEL_FORMAT_YCbCr_422_888 HAL_PIXEL_FORMAT_YCBCR_422_888
-#define HAL_PIXEL_FORMAT_YCbCr_444_888 HAL_PIXEL_FORMAT_YCBCR_444_888
 #define HAL_PIXEL_FORMAT_YCbCr_422_SP HAL_PIXEL_FORMAT_YCBCR_422_SP
 #define HAL_PIXEL_FORMAT_YCrCb_420_SP HAL_PIXEL_FORMAT_YCRCB_420_SP
 #define HAL_PIXEL_FORMAT_YCbCr_422_I HAL_PIXEL_FORMAT_YCBCR_422_I
@@ -60,12 +59,14 @@ typedef android_hdr_t android_hdr;
 
 /*
  * Structure for describing YCbCr formats for consumption by applications.
- * This is used with HAL_PIXEL_FORMAT_YCbCr_*_888.
+ * This is used with HAL_PIXEL_FORMAT_YCbCr_*.
  *
  * Buffer chroma subsampling is defined in the format.
  * e.g. HAL_PIXEL_FORMAT_YCbCr_420_888 has subsampling 4:2:0.
  *
- * Buffers must have a 8 bit depth.
+ * Buffers must have a byte aligned channel depth or a byte aligned packed
+ * channel depth (e.g. 10 bits packed into 16 bits for
+ * HAL_PIXEL_FORMAT_YCbCr_P010).
  *
  * y, cb, and cr point to the first byte of their respective planes.
  *
@@ -76,8 +77,8 @@ typedef android_hdr_t android_hdr;
  * cstride is the stride of the chroma planes.
  *
  * chroma_step is the distance in bytes from one chroma pixel value to the
- * next.  This is 2 bytes for semiplanar (because chroma values are interleaved
- * and each chroma value is one byte) and 1 for planar.
+ * next.  This is `2 * channel depth` bytes for semiplanar (because chroma
+ * values are interleaved) and `1 * channel depth` bytes for planar.
  */
 
 struct android_ycbcr {
@@ -255,6 +256,11 @@ struct android_smpte2086_metadata {
     struct android_xy_color whitePoint;
     float maxLuminance;
     float minLuminance;
+};
+
+struct android_cta861_3_metadata {
+    float maxContentLightLevel;
+    float maxFrameAverageLightLevel;
 };
 
 #ifdef __cplusplus

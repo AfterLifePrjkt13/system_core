@@ -22,6 +22,8 @@
 #include <utils/Errors.h>
 #include <utils/String8.h>
 
+#include <vector>
+
 // periodic_chores_interval_fast, periodic_chores_interval_slow: intervals at
 // which healthd wakes up to poll health state and perform periodic chores,
 // in units of seconds:
@@ -67,10 +69,14 @@ struct healthd_config {
     android::String8 batteryChargeCounterPath;
     android::String8 batteryFullChargePath;
     android::String8 batteryCycleCountPath;
+    android::String8 batteryCapacityLevelPath;
+    android::String8 batteryChargeTimeToFullNowPath;
+    android::String8 batteryFullChargeDesignCapacityUahPath;
 
     int (*energyCounter)(int64_t *);
     int boot_min_cap;
     bool (*screen_on)(android::BatteryProperties *props);
+    std::vector<android::String8> ignorePowerSupplyNames;
 };
 
 enum EventWakeup {
@@ -81,10 +87,6 @@ enum EventWakeup {
 // Global helper functions
 
 int healthd_register_event(int fd, void (*handler)(uint32_t), EventWakeup wakeup = EVENT_NO_WAKEUP_FD);
-void healthd_battery_update();
-android::status_t healthd_get_property(int id,
-    struct android::BatteryProperty *val);
-void healthd_dump_battery_state(int fd);
 
 struct healthd_mode_ops {
     void (*init)(struct healthd_config *config);

@@ -12,15 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-subdirs = [
-    "tipc-test",
-]
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
+cc_defaults {
+    name: "libtrusty_defaults",
+    srcs: ["trusty.c"],
+    export_include_dirs: ["include"],
+    cflags: [
+        "-Wall",
+        "-Werror",
+    ],
+
+    shared_libs: ["liblog"],
+}
 
 cc_library {
     name: "libtrusty",
-
-    srcs: ["trusty.c"],
-    export_include_dirs: ["include"],
-
-    shared_libs: ["liblog"],
+    // TODO(b/170753563): cc_fuzz can't deal with vendor components. Build
+    // libtrusty for system and vendor.
+    vendor_available: true,
+    defaults: ["libtrusty_defaults"],
 }

@@ -14,33 +14,30 @@
  * limitations under the License.
  */
 
-#ifndef _INIT_UEVENTD_PARSER_H
-#define _INIT_UEVENTD_PARSER_H
+#pragma once
 
 #include <string>
 #include <vector>
 
 #include "devices.h"
-#include "init_parser.h"
+#include "firmware_handler.h"
 
-class SubsystemParser : public SectionParser {
-  public:
-    SubsystemParser(std::vector<Subsystem>* subsystems) : subsystems_(subsystems) {}
-    bool ParseSection(std::vector<std::string>&& args, const std::string& filename, int line,
-                      std::string* err) override;
-    bool ParseLineSection(std::vector<std::string>&& args, int line, std::string* err) override;
-    void EndSection() override;
+namespace android {
+namespace init {
 
-  private:
-    bool ParseDevName(std::vector<std::string>&& args, std::string* err);
-    bool ParseDirName(std::vector<std::string>&& args, std::string* err);
-
-    Subsystem subsystem_;
-    std::vector<Subsystem>* subsystems_;
+struct UeventdConfiguration {
+    std::vector<Subsystem> subsystems;
+    std::vector<SysfsPermissions> sysfs_permissions;
+    std::vector<Permissions> dev_permissions;
+    std::vector<std::string> firmware_directories;
+    std::vector<ExternalFirmwareHandler> external_firmware_handlers;
+    std::vector<std::string> parallel_restorecon_dirs;
+    bool enable_modalias_handling = false;
+    size_t uevent_socket_rcvbuf_size = 0;
+    bool enable_parallel_restorecon = false;
 };
 
-bool ParsePermissionsLine(std::vector<std::string>&& args, std::string* err,
-                          std::vector<SysfsPermissions>* out_sysfs_permissions,
-                          std::vector<Permissions>* out_dev_permissions);
+UeventdConfiguration ParseConfig(const std::vector<std::string>& configs);
 
-#endif
+}  // namespace init
+}  // namespace android

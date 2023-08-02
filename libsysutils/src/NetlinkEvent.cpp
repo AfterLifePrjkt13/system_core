@@ -17,38 +17,188 @@
 #define LOG_TAG "NetlinkEvent"
 
 #include <arpa/inet.h>
+#include <limits.h>
+#include <linux/genetlink.h>
 #include <linux/if.h>
 #include <linux/if_addr.h>
 #include <linux/if_link.h>
 #include <linux/netfilter/nfnetlink.h>
 #include <linux/netfilter/nfnetlink_log.h>
-#include <linux/netfilter_ipv4/ipt_ULOG.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
 #include <net/if.h>
-#include <netinet/in.h>
 #include <netinet/icmp6.h>
-#include <netlink/attr.h>
-#include <netlink/genl/genl.h>
-#include <netlink/handlers.h>
-#include <netlink/msg.h>
+#include <netinet/in.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/personality.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/utsname.h>
+
+#include <android-base/parseint.h>
+#include <log/log.h>
+#include <sysutils/NetlinkEvent.h>
+
+using android::base::ParseInt;
 
 /* From kernel's net/netfilter/xt_quota2.c */
 const int LOCAL_QLOG_NL_EVENT = 112;
 const int LOCAL_NFLOG_PACKET = NFNL_SUBSYS_ULOG << 8 | NFULNL_MSG_PACKET;
 
-#include <log/log.h>
-#include <sysutils/NetlinkEvent.h>
+/******************************************************************************
+ * WARNING: HERE BE DRAGONS!                                                  *
+ *                                                                            *
+ * This is here to provide for compatibility with both 32 and 64-bit kernels  *
+ * from 32-bit userspace.                                                     *
+ *                                                                            *
+ * The kernel definition of this struct uses types (like long) that are not   *
+ * the same across 32-bit and 64-bit builds, and there is no compatibility    *
+ * layer to fix it up before it reaches userspace.                            *
+ * As such we need to detect the bit-ness of the kernel and deal with it.     *
+ *                                                                            *
+ ******************************************************************************/
+
+/*
+ * This is the verbatim kernel declaration from net/netfilter/xt_quota2.c,
+ * it is *NOT* of a well defined layout and is included here for compile
+ * time assertions only.
+ *
+ * It got there from deprecated ipt_ULOG.h to parse QLOG_NL_EVENT.
+ */
+#define ULOG_MAC_LEN 80
+#define ULOG_PREFIX_LEN 32
+typedef struct ulog_packet_msg {
+    unsigned long mark;
+    long timestamp_sec;
+    long timestamp_usec;
+    unsigned int hook;
+    char indev_name[IFNAMSIZ];
+    char outdev_name[IFNAMSIZ];
+    size_t data_len;
+    char prefix[ULOG_PREFIX_LEN];
+    unsigned char mac_len;
+    unsigned char mac[ULOG_MAC_LEN];
+    unsigned char payload[0];
+} ulog_packet_msg_t;
+
+// On Linux int is always 32 bits, while sizeof(long) == sizeof(void*),
+// thus long on a 32-bit Linux kernel is 32-bits, like int always is
+typedef int long32;
+typedef unsigned int ulong32;
+static_assert(sizeof(long32) == 4);
+static_assert(sizeof(ulong32) == 4);
+
+// Here's the same structure definition with the assumption the kernel
+// is compiled for 32-bits.
+typedef struct {
+    ulong32 mark;
+    long32 timestamp_sec;
+    long32 timestamp_usec;
+    unsigned int hook;
+    char indev_name[IFNAMSIZ];
+    char outdev_name[IFNAMSIZ];
+    ulong32 data_len;
+    char prefix[ULOG_PREFIX_LEN];
+    unsigned char mac_len;
+    unsigned char mac[ULOG_MAC_LEN];
+    unsigned char payload[0];
+} ulog_packet_msg32_t;
+
+// long on a 64-bit kernel is 64-bits with 64-bit alignment,
+// while long long is 64-bit but may have 32-bit aligment.
+typedef long long __attribute__((__aligned__(8))) long64;
+typedef unsigned long long __attribute__((__aligned__(8))) ulong64;
+static_assert(sizeof(long64) == 8);
+static_assert(sizeof(ulong64) == 8);
+
+// Here's the same structure definition with the assumption the kernel
+// is compiled for 64-bits.
+typedef struct {
+    ulong64 mark;
+    long64 timestamp_sec;
+    long64 timestamp_usec;
+    unsigned int hook;
+    char indev_name[IFNAMSIZ];
+    char outdev_name[IFNAMSIZ];
+    ulong64 data_len;
+    char prefix[ULOG_PREFIX_LEN];
+    unsigned char mac_len;
+    unsigned char mac[ULOG_MAC_LEN];
+    unsigned char payload[0];
+} ulog_packet_msg64_t;
+
+// One expects the 32-bit version to be smaller than the 64-bit version.
+static_assert(sizeof(ulog_packet_msg32_t) < sizeof(ulog_packet_msg64_t));
+// And either way the 'native' version should match either the 32 or 64 bit one.
+static_assert(sizeof(ulog_packet_msg_t) == sizeof(ulog_packet_msg32_t) ||
+              sizeof(ulog_packet_msg_t) == sizeof(ulog_packet_msg64_t));
+
+// In practice these sizes are always simply (for both x86 and arm):
+static_assert(sizeof(ulog_packet_msg32_t) == 168);
+static_assert(sizeof(ulog_packet_msg64_t) == 192);
+
+// Figure out the bitness of userspace.
+// Trivial and known at compile time.
+static bool isUserspace64bit(void) {
+    return sizeof(long) == 8;
+}
+
+// Figure out the bitness of the kernel.
+static bool isKernel64Bit(void) {
+    // a 64-bit userspace requires a 64-bit kernel
+    if (isUserspace64bit()) return true;
+
+    static bool init = false;
+    static bool cache = false;
+    if (init) return cache;
+
+    // Retrieve current personality - on Linux this system call *cannot* fail.
+    int p = personality(0xffffffff);
+    // But if it does just assume kernel and userspace (which is 32-bit) match...
+    if (p == -1) return false;
+
+    // This will effectively mask out the bottom 8 bits, and switch to 'native'
+    // personality, and then return the previous personality of this thread
+    // (likely PER_LINUX or PER_LINUX32) with any extra options unmodified.
+    int q = personality((p & ~PER_MASK) | PER_LINUX);
+    // Per man page this theoretically could error out with EINVAL,
+    // but kernel code analysis suggests setting PER_LINUX cannot fail.
+    // Either way, assume kernel and userspace (which is 32-bit) match...
+    if (q != p) return false;
+
+    struct utsname u;
+    (void)uname(&u);  // only possible failure is EFAULT, but u is on stack.
+
+    // Switch back to previous personality.
+    // Theoretically could fail with EINVAL on arm64 with no 32-bit support,
+    // but then we wouldn't have fetched 'p' from the kernel in the first place.
+    // Either way there's nothing meaningul we can do in case of error.
+    // Since PER_LINUX32 vs PER_LINUX only affects uname.machine it doesn't
+    // really hurt us either.  We're really just switching back to be 'clean'.
+    (void)personality(p);
+
+    // Possible values of utsname.machine observed on x86_64 desktop (arm via qemu):
+    //   x86_64 i686 aarch64 armv7l
+    // additionally observed on arm device:
+    //   armv8l
+    // presumably also might just be possible:
+    //   i386 i486 i586
+    // and there might be other weird arm32 cases.
+    // We note that the 64 is present in both 64-bit archs,
+    // and in general is likely to be present in only 64-bit archs.
+    cache = !!strstr(u.machine, "64");
+    init = true;
+    return cache;
+}
+
+/******************************************************************************/
 
 NetlinkEvent::NetlinkEvent() {
     mAction = Action::kUnknown;
     memset(mParams, 0, sizeof(mParams));
-    mPath = NULL;
-    mSubsystem = NULL;
+    mPath = nullptr;
+    mSubsystem = nullptr;
 }
 
 NetlinkEvent::~NetlinkEvent() {
@@ -91,7 +241,7 @@ static const char *rtMessageName(int type) {
         NL_EVENT_RTM_NAME(LOCAL_QLOG_NL_EVENT);
         NL_EVENT_RTM_NAME(LOCAL_NFLOG_PACKET);
         default:
-            return NULL;
+            return nullptr;
     }
 #undef NL_EVENT_RTM_NAME
 }
@@ -139,6 +289,12 @@ bool NetlinkEvent::parseIfInfoMessage(const struct nlmsghdr *nh) {
         switch(rta->rta_type) {
             case IFLA_IFNAME:
                 asprintf(&mParams[0], "INTERFACE=%s", (char *) RTA_DATA(rta));
+                // We can get the interface change information from sysfs update
+                // already. But in case we missed those message when devices start.
+                // We do a update again when received a kLinkUp event. To make
+                // the message consistent, use IFINDEX here as well since sysfs
+                // uses IFINDEX.
+                asprintf(&mParams[1], "IFINDEX=%d", ifi->ifi_index);
                 mAction = (ifi->ifi_flags & IFF_LOWER_UP) ? Action::kLinkUp :
                                                             Action::kLinkDown;
                 mSubsystem = strdup("net");
@@ -154,14 +310,14 @@ bool NetlinkEvent::parseIfInfoMessage(const struct nlmsghdr *nh) {
  */
 bool NetlinkEvent::parseIfAddrMessage(const struct nlmsghdr *nh) {
     struct ifaddrmsg *ifaddr = (struct ifaddrmsg *) NLMSG_DATA(nh);
-    struct ifa_cacheinfo *cacheinfo = NULL;
+    struct ifa_cacheinfo *cacheinfo = nullptr;
     char addrstr[INET6_ADDRSTRLEN] = "";
     char ifname[IFNAMSIZ] = "";
+    uint32_t flags;
 
     if (!checkRtNetlinkLength(nh, sizeof(*ifaddr)))
         return false;
 
-    // Sanity check.
     int type = nh->nlmsg_type;
     if (type != RTM_NEWADDR && type != RTM_DELADDR) {
         SLOGE("parseIfAddrMessage on incorrect message type 0x%x\n", type);
@@ -170,6 +326,9 @@ bool NetlinkEvent::parseIfAddrMessage(const struct nlmsghdr *nh) {
 
     // For log messages.
     const char *msgtype = rtMessageName(type);
+
+    // First 8 bits of flags. In practice will always be overridden when parsing IFA_FLAGS below.
+    flags = ifaddr->ifa_flags;
 
     struct rtattr *rta;
     int len = IFA_PAYLOAD(nh);
@@ -219,6 +378,9 @@ bool NetlinkEvent::parseIfAddrMessage(const struct nlmsghdr *nh) {
             }
 
             cacheinfo = (struct ifa_cacheinfo *) RTA_DATA(rta);
+
+        } else if (rta->rta_type == IFA_FLAGS) {
+            flags = *(uint32_t*)RTA_DATA(rta);
         }
     }
 
@@ -233,14 +395,15 @@ bool NetlinkEvent::parseIfAddrMessage(const struct nlmsghdr *nh) {
     mSubsystem = strdup("net");
     asprintf(&mParams[0], "ADDRESS=%s/%d", addrstr, ifaddr->ifa_prefixlen);
     asprintf(&mParams[1], "INTERFACE=%s", ifname);
-    asprintf(&mParams[2], "FLAGS=%u", ifaddr->ifa_flags);
+    asprintf(&mParams[2], "FLAGS=%u", flags);
     asprintf(&mParams[3], "SCOPE=%u", ifaddr->ifa_scope);
+    asprintf(&mParams[4], "IFINDEX=%u", ifaddr->ifa_index);
 
     if (cacheinfo) {
-        asprintf(&mParams[4], "PREFERRED=%u", cacheinfo->ifa_prefered);
-        asprintf(&mParams[5], "VALID=%u", cacheinfo->ifa_valid);
-        asprintf(&mParams[6], "CSTAMP=%u", cacheinfo->cstamp);
-        asprintf(&mParams[7], "TSTAMP=%u", cacheinfo->tstamp);
+        asprintf(&mParams[5], "PREFERRED=%u", cacheinfo->ifa_prefered);
+        asprintf(&mParams[6], "VALID=%u", cacheinfo->ifa_valid);
+        asprintf(&mParams[7], "CSTAMP=%u", cacheinfo->cstamp);
+        asprintf(&mParams[8], "TSTAMP=%u", cacheinfo->tstamp);
     }
 
     return true;
@@ -250,17 +413,38 @@ bool NetlinkEvent::parseIfAddrMessage(const struct nlmsghdr *nh) {
  * Parse a QLOG_NL_EVENT message.
  */
 bool NetlinkEvent::parseUlogPacketMessage(const struct nlmsghdr *nh) {
-    const char *devname;
-    ulog_packet_msg_t *pm = (ulog_packet_msg_t *) NLMSG_DATA(nh);
-    if (!checkRtNetlinkLength(nh, sizeof(*pm)))
-        return false;
+    const char* alert;
+    const char* devname;
 
-    devname = pm->indev_name[0] ? pm->indev_name : pm->outdev_name;
-    asprintf(&mParams[0], "ALERT_NAME=%s", pm->prefix);
+    if (isKernel64Bit()) {
+        ulog_packet_msg64_t* pm64 = (ulog_packet_msg64_t*)NLMSG_DATA(nh);
+        if (!checkRtNetlinkLength(nh, sizeof(*pm64))) return false;
+        alert = pm64->prefix;
+        devname = pm64->indev_name[0] ? pm64->indev_name : pm64->outdev_name;
+    } else {
+        ulog_packet_msg32_t* pm32 = (ulog_packet_msg32_t*)NLMSG_DATA(nh);
+        if (!checkRtNetlinkLength(nh, sizeof(*pm32))) return false;
+        alert = pm32->prefix;
+        devname = pm32->indev_name[0] ? pm32->indev_name : pm32->outdev_name;
+    }
+
+    asprintf(&mParams[0], "ALERT_NAME=%s", alert);
     asprintf(&mParams[1], "INTERFACE=%s", devname);
     mSubsystem = strdup("qlog");
     mAction = Action::kChange;
     return true;
+}
+
+static size_t nlAttrLen(const nlattr* nla) {
+    return nla->nla_len - NLA_HDRLEN;
+}
+
+static const uint8_t* nlAttrData(const nlattr* nla) {
+    return reinterpret_cast<const uint8_t*>(nla) + NLA_HDRLEN;
+}
+
+static uint32_t nlAttrU32(const nlattr* nla) {
+    return *reinterpret_cast<const uint32_t*>(nlAttrData(nla));
 }
 
 /*
@@ -269,23 +453,24 @@ bool NetlinkEvent::parseUlogPacketMessage(const struct nlmsghdr *nh) {
 bool NetlinkEvent::parseNfPacketMessage(struct nlmsghdr *nh) {
     int uid = -1;
     int len = 0;
-    char* raw = NULL;
+    char* raw = nullptr;
 
-    struct nlattr *uid_attr = nlmsg_find_attr(nh, sizeof(struct genlmsghdr), NFULA_UID);
+    struct nlattr* uid_attr = findNlAttr(nh, sizeof(struct genlmsghdr), NFULA_UID);
     if (uid_attr) {
-        uid = ntohl(nla_get_u32(uid_attr));
+        uid = ntohl(nlAttrU32(uid_attr));
     }
 
-    struct nlattr *payload = nlmsg_find_attr(nh, sizeof(struct genlmsghdr), NFULA_PAYLOAD);
+    struct nlattr* payload = findNlAttr(nh, sizeof(struct genlmsghdr), NFULA_PAYLOAD);
     if (payload) {
         /* First 256 bytes is plenty */
-        len = nla_len(payload);
+        len = nlAttrLen(payload);
         if (len > 256) len = 256;
-        raw = (char*) nla_data(payload);
+        raw = (char*)nlAttrData(payload);
     }
 
-    char* hex = (char*) calloc(1, 5 + (len * 2));
-    strcpy(hex, "HEX=");
+    size_t hexSize = 5 + (len * 2);
+    char* hex = (char*)calloc(1, hexSize);
+    strlcpy(hex, "HEX=", hexSize);
     for (int i = 0; i < len; i++) {
         hex[4 + (i * 2)] = "0123456789abcdef"[(raw[i] >> 4) & 0xf];
         hex[5 + (i * 2)] = "0123456789abcdef"[raw[i] & 0xf];
@@ -305,7 +490,6 @@ bool NetlinkEvent::parseRtMessage(const struct nlmsghdr *nh) {
     uint8_t type = nh->nlmsg_type;
     const char *msgname = rtMessageName(type);
 
-    // Sanity check.
     if (type != RTM_NEWROUTE && type != RTM_DELROUTE) {
         SLOGE("%s: incorrect message type %d (%s)\n", __func__, type, msgname);
         return false;
@@ -357,6 +541,7 @@ bool NetlinkEvent::parseRtMessage(const struct nlmsghdr *nh) {
                     continue;
                 if (!if_indextoname(* (int *) RTA_DATA(rta), dev))
                     return false;
+                continue;
             default:
                 continue;
         }
@@ -456,23 +641,20 @@ bool NetlinkEvent::parseNdUserOptMessage(const struct nlmsghdr *nh) {
         struct nd_opt_rdnss *rndss_opt = (struct nd_opt_rdnss *) opthdr;
         const uint32_t lifetime = ntohl(rndss_opt->nd_opt_rdnss_lifetime);
 
-        // Construct "SERVERS=<comma-separated string of DNS addresses>".
-        static const char kServerTag[] = "SERVERS=";
-        static const size_t kTagLength = strlen(kServerTag);
+        // Construct a comma-separated string of DNS addresses.
         // Reserve sufficient space for an IPv6 link-local address: all but the
         // last address are followed by ','; the last is followed by '\0'.
         static const size_t kMaxSingleAddressLength =
                 INET6_ADDRSTRLEN + strlen("%") + IFNAMSIZ + strlen(",");
-        const size_t bufsize = kTagLength + numaddrs * kMaxSingleAddressLength;
+        const size_t bufsize = numaddrs * kMaxSingleAddressLength;
         char *buf = (char *) malloc(bufsize);
         if (!buf) {
             SLOGE("RDNSS option: out of memory\n");
             return false;
         }
-        strcpy(buf, kServerTag);
-        size_t pos = kTagLength;
 
         struct in6_addr *addrs = (struct in6_addr *) (rndss_opt + 1);
+        size_t pos = 0;
         for (int i = 0; i < numaddrs; i++) {
             if (i > 0) {
                 buf[pos++] = ',';
@@ -490,7 +672,14 @@ bool NetlinkEvent::parseNdUserOptMessage(const struct nlmsghdr *nh) {
         mSubsystem = strdup("net");
         asprintf(&mParams[0], "INTERFACE=%s", ifname);
         asprintf(&mParams[1], "LIFETIME=%u", lifetime);
-        mParams[2] = buf;
+        asprintf(&mParams[2], "SERVERS=%s", buf);
+        free(buf);
+    } else if (opthdr->nd_opt_type == ND_OPT_DNSSL) {
+        // TODO: support DNSSL.
+    } else if (opthdr->nd_opt_type == ND_OPT_CAPTIVE_PORTAL) {
+        // TODO: support CAPTIVE PORTAL.
+    } else if (opthdr->nd_opt_type == ND_OPT_PREF64) {
+        // TODO: support PREF64.
     } else {
         SLOGD("Unknown ND option type %d\n", opthdr->nd_opt_type);
         return false;
@@ -565,7 +754,7 @@ has_prefix(const char* str, const char* end, const char* prefix, size_t prefixle
         (prefixlen == 0 || !memcmp(str, prefix, prefixlen))) {
         return str + prefixlen;
     } else {
-        return NULL;
+        return nullptr;
     }
 }
 
@@ -606,16 +795,18 @@ bool NetlinkEvent::parseAsciiNetlinkMessage(char *buffer, int size) {
             first = 0;
         } else {
             const char* a;
-            if ((a = HAS_CONST_PREFIX(s, end, "ACTION=")) != NULL) {
+            if ((a = HAS_CONST_PREFIX(s, end, "ACTION=")) != nullptr) {
                 if (!strcmp(a, "add"))
                     mAction = Action::kAdd;
                 else if (!strcmp(a, "remove"))
                     mAction = Action::kRemove;
                 else if (!strcmp(a, "change"))
                     mAction = Action::kChange;
-            } else if ((a = HAS_CONST_PREFIX(s, end, "SEQNUM=")) != NULL) {
-                mSeq = atoi(a);
-            } else if ((a = HAS_CONST_PREFIX(s, end, "SUBSYSTEM=")) != NULL) {
+            } else if ((a = HAS_CONST_PREFIX(s, end, "SEQNUM=")) != nullptr) {
+                if (!ParseInt(a, &mSeq)) {
+                    SLOGE("NetlinkEvent::parseAsciiNetlinkMessage: failed to parse SEQNUM=%s", a);
+                }
+            } else if ((a = HAS_CONST_PREFIX(s, end, "SUBSYSTEM=")) != nullptr) {
                 mSubsystem = strdup(a);
             } else if (param_idx < NL_PARAMS_MAX) {
                 mParams[param_idx++] = strdup(s);
@@ -637,12 +828,35 @@ bool NetlinkEvent::decode(char *buffer, int size, int format) {
 
 const char *NetlinkEvent::findParam(const char *paramName) {
     size_t len = strlen(paramName);
-    for (int i = 0; i < NL_PARAMS_MAX && mParams[i] != NULL; ++i) {
+    for (int i = 0; i < NL_PARAMS_MAX && mParams[i] != nullptr; ++i) {
         const char *ptr = mParams[i] + len;
         if (!strncmp(mParams[i], paramName, len) && *ptr == '=')
             return ++ptr;
     }
 
     SLOGE("NetlinkEvent::FindParam(): Parameter '%s' not found", paramName);
-    return NULL;
+    return nullptr;
+}
+
+nlattr* NetlinkEvent::findNlAttr(const nlmsghdr* nh, size_t hdrlen, uint16_t attr) {
+    if (nh == nullptr || NLMSG_HDRLEN + NLMSG_ALIGN(hdrlen) > SSIZE_MAX) {
+        return nullptr;
+    }
+
+    // Skip header, padding, and family header.
+    const ssize_t NLA_START = NLMSG_HDRLEN + NLMSG_ALIGN(hdrlen);
+    ssize_t left = nh->nlmsg_len - NLA_START;
+    uint8_t* hdr = ((uint8_t*)nh) + NLA_START;
+
+    while (left >= NLA_HDRLEN) {
+        nlattr* nla = (nlattr*)hdr;
+        if (nla->nla_type == attr) {
+            return nla;
+        }
+
+        hdr += NLA_ALIGN(nla->nla_len);
+        left -= NLA_ALIGN(nla->nla_len);
+    }
+
+    return nullptr;
 }

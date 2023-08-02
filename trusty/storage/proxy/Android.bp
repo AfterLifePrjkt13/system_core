@@ -14,19 +14,34 @@
 // limitations under the License.
 //
 
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
 cc_binary {
     name: "storageproxyd",
+    vendor: true,
 
     srcs: [
+        "checkpoint_handling.cpp",
         "ipc.c",
         "rpmb.c",
         "storage.c",
         "proxy.c",
     ],
 
-    shared_libs: ["liblog"],
+    shared_libs: [
+        "libbase",
+        "libcutils",
+        "liblog",
+        "libhardware_legacy",
+    ],
+    header_libs: [
+        "libgsi_headers",
+    ],
 
     static_libs: [
+        "libfstab",
         "libtrustystorageinterface",
         "libtrusty",
     ],
@@ -34,5 +49,5 @@ cc_binary {
     cflags: [
         "-Wall",
         "-Werror",
-    ]
+    ],
 }

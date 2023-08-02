@@ -1,6 +1,14 @@
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
 cc_library {
     name: "libdiskconfig",
+    recovery_available: true,
     vendor_available: true,
+    vndk: {
+        enabled: true,
+    },
     srcs: [
         "diskconfig.c",
         "diskutils.c",
@@ -20,12 +28,8 @@ cc_library {
         darwin: {
             enabled: false,
         },
-        linux: {
+        host_linux: {
             cflags: [
-                "-O2",
-                "-g",
-                "-W",
-                "-Wall",
                 "-D_LARGEFILE64_SOURCE",
             ],
         },

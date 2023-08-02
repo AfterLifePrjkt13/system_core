@@ -16,7 +16,10 @@
 
 #pragma once
 
+#include <signal.h>
 #include <stdint.h>
+#include <sys/ucontext.h>
+#include <unistd.h>
 
 #include "dump_type.h"
 
@@ -75,4 +78,32 @@ enum class InterceptStatus : uint8_t {
 struct InterceptResponse {
   InterceptStatus status;
   char error_message[127];  // always null-terminated
+};
+
+// Sent from handler to crash_dump via pipe.
+struct __attribute__((__packed__)) CrashInfoHeader {
+  uint32_t version;
+};
+
+struct __attribute__((__packed__)) CrashInfoDataStatic {
+  siginfo_t siginfo;
+  ucontext_t ucontext;
+  uintptr_t abort_msg_address;
+};
+
+struct __attribute__((__packed__)) CrashInfoDataDynamic : public CrashInfoDataStatic {
+  uintptr_t fdsan_table_address;
+  uintptr_t gwp_asan_state;
+  uintptr_t gwp_asan_metadata;
+  uintptr_t scudo_stack_depot;
+  uintptr_t scudo_region_info;
+  uintptr_t scudo_ring_buffer;
+};
+
+struct __attribute__((__packed__)) CrashInfo {
+  CrashInfoHeader header;
+  union {
+    CrashInfoDataStatic s;
+    CrashInfoDataDynamic d;
+  } data;
 };

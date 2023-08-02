@@ -18,9 +18,10 @@
 #define HEALTHD_ANIMATION_H
 
 #include <inttypes.h>
+
 #include <string>
 
-struct GRSurface;
+class GRSurface;
 struct GRFont;
 
 namespace android {
@@ -48,6 +49,16 @@ struct animation {
         GRFont* font;
     };
 
+    // When libminui loads PNG images:
+    // - When treating paths as relative paths, it adds ".png" suffix.
+    // - When treating paths as absolute paths, it doesn't add the suffix. Hence, the suffix
+    //   is added here.
+    // If |backup_root| is provided, additionally check if file under |root| is accessbile or not.
+    // If not accessbile, use |backup_root| instead.
+    // Require that |root| starts and ends with "/". If |backup_root| is provided, require that
+    // |backup_root| starts and ends with "/".
+    void set_resource_root(const std::string& root, const std::string& backup_root = "");
+
     std::string animation_file;
     std::string fail_file;
 
@@ -56,7 +67,7 @@ struct animation {
 
     bool run;
 
-    frame* frames;
+    frame* frames = nullptr;
     int cur_frame;
     int num_frames;
     int first_frame_repeats;  // Number of times to repeat the first frame in the current cycle
@@ -66,6 +77,8 @@ struct animation {
 
     int cur_level;  // current battery level being animated (0-100)
     int cur_status;  // current battery status - see BatteryService.h for BATTERY_STATUS_*
+
+    ~animation() { delete frames; }
 };
 
 }

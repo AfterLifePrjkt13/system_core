@@ -14,19 +14,25 @@
 // limitations under the License.
 //
 
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
 cc_library {
     name: "libusbhost",
+    vendor_available: true,
+    vndk: {
+        enabled: true,
+    },
     host_supported: true,
     srcs: ["usbhost.c"],
     cflags: ["-Werror"],
     export_include_dirs: ["include"],
     target: {
         android: {
-            cflags: [
-                "-g",
-                "-DUSE_LIBLOG",
-            ],
+            header_libs: ["jni_headers"],
             shared_libs: ["liblog"],
+            srcs: ["usbhost_jni.cpp"],
         },
         darwin: {
             enabled: false,

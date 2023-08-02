@@ -16,40 +16,35 @@
 
 #include "devices.h"
 
-#include <string>
-#include <vector>
-
+#include <android-base/file.h>
 #include <android-base/scopeguard.h>
 #include <gtest/gtest.h>
 
+#include "util.h"
+
+using namespace std::string_literals;
+
+namespace android {
+namespace init {
+
 class DeviceHandlerTester {
   public:
-    void AddPlatformDevice(const std::string& path) {
-        Uevent uevent = {
-            .action = "add", .subsystem = "platform", .path = path,
-        };
-        device_handler_.HandlePlatformDeviceEvent(uevent);
-    }
+    void TestGetSymlinks(const std::string& platform_device, const Uevent& uevent,
+                         const std::vector<std::string>& expected_links) {
+        TemporaryDir fake_sys_root;
+        device_handler_.sysfs_mount_point_ = fake_sys_root.path;
 
-    void RemovePlatformDevice(const std::string& path) {
-        Uevent uevent = {
-            .action = "remove", .subsystem = "platform", .path = path,
-        };
-        device_handler_.HandlePlatformDeviceEvent(uevent);
-    }
+        std::string platform_device_dir = fake_sys_root.path + platform_device;
+        mkdir_recursive(platform_device_dir, 0777);
 
-    void TestGetSymlinks(const std::string& platform_device_name, const Uevent& uevent,
-                         const std::vector<std::string> expected_links, bool block) {
-        AddPlatformDevice(platform_device_name);
-        auto platform_device_remover = android::base::make_scope_guard(
-            [this, &platform_device_name]() { RemovePlatformDevice(platform_device_name); });
+        std::string platform_bus = fake_sys_root.path + "/bus/platform"s;
+        mkdir_recursive(platform_bus, 0777);
+        symlink(platform_bus.c_str(), (platform_device_dir + "/subsystem").c_str());
+
+        mkdir_recursive(android::base::Dirname(fake_sys_root.path + uevent.path), 0777);
 
         std::vector<std::string> result;
-        if (block) {
-            result = device_handler_.GetBlockDeviceSymlinks(uevent);
-        } else {
-            result = device_handler_.GetCharacterDeviceSymlinks(uevent);
-        }
+        result = device_handler_.GetBlockDeviceSymlinks(uevent);
 
         auto expected_size = expected_links.size();
         ASSERT_EQ(expected_size, result.size());
@@ -65,119 +60,6 @@ class DeviceHandlerTester {
     DeviceHandler device_handler_;
 };
 
-TEST(device_handler, PlatformDeviceList) {
-    PlatformDeviceList platform_device_list;
-
-    platform_device_list.Add("/devices/platform/some_device_name");
-    platform_device_list.Add("/devices/platform/some_device_name/longer");
-    platform_device_list.Add("/devices/platform/other_device_name");
-    EXPECT_EQ(3U, platform_device_list.size());
-
-    std::string out_path;
-    EXPECT_FALSE(platform_device_list.Find("/devices/platform/not_found", &out_path));
-    EXPECT_EQ("", out_path);
-
-    EXPECT_FALSE(platform_device_list.Find("/devices/platform/some_device_name_with_same_prefix",
-                                           &out_path));
-
-    EXPECT_TRUE(platform_device_list.Find("/devices/platform/some_device_name/longer/longer_child",
-                                          &out_path));
-    EXPECT_EQ("/devices/platform/some_device_name/longer", out_path);
-
-    EXPECT_TRUE(
-        platform_device_list.Find("/devices/platform/some_device_name/other_child", &out_path));
-    EXPECT_EQ("/devices/platform/some_device_name", out_path);
-}
-
-TEST(device_handler, get_character_device_symlinks_success) {
-    const char* platform_device = "/devices/platform/some_device_name";
-    Uevent uevent = {
-        .path = "/devices/platform/some_device_name/usb/usb_device/name/tty2-1:1.0",
-        .subsystem = "tty",
-    };
-    std::vector<std::string> expected_result{"/dev/usb/ttyname"};
-
-    DeviceHandlerTester device_handler_tester_;
-    device_handler_tester_.TestGetSymlinks(platform_device, uevent, expected_result, false);
-}
-
-TEST(device_handler, get_character_device_symlinks_no_pdev_match) {
-    const char* platform_device = "/devices/platform/some_device_name";
-    Uevent uevent = {
-        .path = "/device/name/tty2-1:1.0", .subsystem = "tty",
-    };
-    std::vector<std::string> expected_result;
-
-    DeviceHandlerTester device_handler_tester_;
-    device_handler_tester_.TestGetSymlinks(platform_device, uevent, expected_result, false);
-}
-
-TEST(device_handler, get_character_device_symlinks_nothing_after_platform_device) {
-    const char* platform_device = "/devices/platform/some_device_name";
-    Uevent uevent = {
-        .path = "/devices/platform/some_device_name", .subsystem = "tty",
-    };
-    std::vector<std::string> expected_result;
-
-    DeviceHandlerTester device_handler_tester_;
-    device_handler_tester_.TestGetSymlinks(platform_device, uevent, expected_result, false);
-}
-
-TEST(device_handler, get_character_device_symlinks_no_usb_found) {
-    const char* platform_device = "/devices/platform/some_device_name";
-    Uevent uevent = {
-        .path = "/devices/platform/some_device_name/bad/bad/", .subsystem = "tty",
-    };
-    std::vector<std::string> expected_result;
-
-    DeviceHandlerTester device_handler_tester_;
-    device_handler_tester_.TestGetSymlinks(platform_device, uevent, expected_result, false);
-}
-
-TEST(device_handler, get_character_device_symlinks_no_roothub) {
-    const char* platform_device = "/devices/platform/some_device_name";
-    Uevent uevent = {
-        .path = "/devices/platform/some_device_name/usb/", .subsystem = "tty",
-    };
-    std::vector<std::string> expected_result;
-
-    DeviceHandlerTester device_handler_tester_;
-    device_handler_tester_.TestGetSymlinks(platform_device, uevent, expected_result, false);
-}
-
-TEST(device_handler, get_character_device_symlinks_no_usb_device) {
-    const char* platform_device = "/devices/platform/some_device_name";
-    Uevent uevent = {
-        .path = "/devices/platform/some_device_name/usb/usb_device/", .subsystem = "tty",
-    };
-    std::vector<std::string> expected_result;
-
-    DeviceHandlerTester device_handler_tester_;
-    device_handler_tester_.TestGetSymlinks(platform_device, uevent, expected_result, false);
-}
-
-TEST(device_handler, get_character_device_symlinks_no_final_slash) {
-    const char* platform_device = "/devices/platform/some_device_name";
-    Uevent uevent = {
-        .path = "/devices/platform/some_device_name/usb/usb_device/name", .subsystem = "tty",
-    };
-    std::vector<std::string> expected_result;
-
-    DeviceHandlerTester device_handler_tester_;
-    device_handler_tester_.TestGetSymlinks(platform_device, uevent, expected_result, false);
-}
-
-TEST(device_handler, get_character_device_symlinks_no_final_name) {
-    const char* platform_device = "/devices/platform/some_device_name";
-    Uevent uevent = {
-        .path = "/devices/platform/some_device_name/usb/usb_device//", .subsystem = "tty",
-    };
-    std::vector<std::string> expected_result;
-
-    DeviceHandlerTester device_handler_tester_;
-    device_handler_tester_.TestGetSymlinks(platform_device, uevent, expected_result, false);
-}
-
 TEST(device_handler, get_block_device_symlinks_success_platform) {
     // These are actual paths from bullhead
     const char* platform_device = "/devices/soc.0/f9824900.sdhci";
@@ -189,7 +71,7 @@ TEST(device_handler, get_block_device_symlinks_success_platform) {
     std::vector<std::string> expected_result{"/dev/block/platform/soc.0/f9824900.sdhci/mmcblk0"};
 
     DeviceHandlerTester device_handler_tester_;
-    device_handler_tester_.TestGetSymlinks(platform_device, uevent, expected_result, true);
+    device_handler_tester_.TestGetSymlinks(platform_device, uevent, expected_result);
 }
 
 TEST(device_handler, get_block_device_symlinks_success_platform_with_partition) {
@@ -202,12 +84,11 @@ TEST(device_handler, get_block_device_symlinks_success_platform_with_partition) 
     };
     std::vector<std::string> expected_result{
         "/dev/block/platform/soc.0/f9824900.sdhci/by-name/modem",
-        "/dev/block/platform/soc.0/f9824900.sdhci/by-num/p1",
         "/dev/block/platform/soc.0/f9824900.sdhci/mmcblk0p1",
     };
 
     DeviceHandlerTester device_handler_tester_;
-    device_handler_tester_.TestGetSymlinks(platform_device, uevent, expected_result, true);
+    device_handler_tester_.TestGetSymlinks(platform_device, uevent, expected_result);
 }
 
 TEST(device_handler, get_block_device_symlinks_success_platform_with_partition_only_num) {
@@ -218,12 +99,11 @@ TEST(device_handler, get_block_device_symlinks_success_platform_with_partition_o
         .partition_num = 1,
     };
     std::vector<std::string> expected_result{
-        "/dev/block/platform/soc.0/f9824900.sdhci/by-num/p1",
         "/dev/block/platform/soc.0/f9824900.sdhci/mmcblk0p1",
     };
 
     DeviceHandlerTester device_handler_tester_;
-    device_handler_tester_.TestGetSymlinks(platform_device, uevent, expected_result, true);
+    device_handler_tester_.TestGetSymlinks(platform_device, uevent, expected_result);
 }
 
 TEST(device_handler, get_block_device_symlinks_success_platform_with_partition_only_name) {
@@ -239,7 +119,7 @@ TEST(device_handler, get_block_device_symlinks_success_platform_with_partition_o
     };
 
     DeviceHandlerTester device_handler_tester_;
-    device_handler_tester_.TestGetSymlinks(platform_device, uevent, expected_result, true);
+    device_handler_tester_.TestGetSymlinks(platform_device, uevent, expected_result);
 }
 
 TEST(device_handler, get_block_device_symlinks_success_pci) {
@@ -250,7 +130,7 @@ TEST(device_handler, get_block_device_symlinks_success_pci) {
     std::vector<std::string> expected_result{"/dev/block/pci/pci0000:00/0000:00:1f.2/mmcblk0"};
 
     DeviceHandlerTester device_handler_tester_;
-    device_handler_tester_.TestGetSymlinks(platform_device, uevent, expected_result, true);
+    device_handler_tester_.TestGetSymlinks(platform_device, uevent, expected_result);
 }
 
 TEST(device_handler, get_block_device_symlinks_pci_bad_format) {
@@ -261,7 +141,7 @@ TEST(device_handler, get_block_device_symlinks_pci_bad_format) {
     std::vector<std::string> expected_result{};
 
     DeviceHandlerTester device_handler_tester_;
-    device_handler_tester_.TestGetSymlinks(platform_device, uevent, expected_result, true);
+    device_handler_tester_.TestGetSymlinks(platform_device, uevent, expected_result);
 }
 
 TEST(device_handler, get_block_device_symlinks_success_vbd) {
@@ -272,7 +152,7 @@ TEST(device_handler, get_block_device_symlinks_success_vbd) {
     std::vector<std::string> expected_result{"/dev/block/vbd/1234/mmcblk0"};
 
     DeviceHandlerTester device_handler_tester_;
-    device_handler_tester_.TestGetSymlinks(platform_device, uevent, expected_result, true);
+    device_handler_tester_.TestGetSymlinks(platform_device, uevent, expected_result);
 }
 
 TEST(device_handler, get_block_device_symlinks_vbd_bad_format) {
@@ -283,7 +163,7 @@ TEST(device_handler, get_block_device_symlinks_vbd_bad_format) {
     std::vector<std::string> expected_result{};
 
     DeviceHandlerTester device_handler_tester_;
-    device_handler_tester_.TestGetSymlinks(platform_device, uevent, expected_result, true);
+    device_handler_tester_.TestGetSymlinks(platform_device, uevent, expected_result);
 }
 
 TEST(device_handler, get_block_device_symlinks_no_matches) {
@@ -296,7 +176,7 @@ TEST(device_handler, get_block_device_symlinks_no_matches) {
     std::vector<std::string> expected_result;
 
     DeviceHandlerTester device_handler_tester_;
-    device_handler_tester_.TestGetSymlinks(platform_device, uevent, expected_result, true);
+    device_handler_tester_.TestGetSymlinks(platform_device, uevent, expected_result);
 }
 
 TEST(device_handler, sanitize_null) {
@@ -341,7 +221,7 @@ TEST(device_handler, sanitize_onebad) {
 TEST(device_handler, DevPermissionsMatchNormal) {
     // Basic from ueventd.rc
     // /dev/null                 0666   root       root
-    Permissions permissions("/dev/null", 0666, 0, 0);
+    Permissions permissions("/dev/null", 0666, 0, 0, false);
     EXPECT_TRUE(permissions.Match("/dev/null"));
     EXPECT_FALSE(permissions.Match("/dev/nullsuffix"));
     EXPECT_FALSE(permissions.Match("/dev/nul"));
@@ -353,7 +233,7 @@ TEST(device_handler, DevPermissionsMatchNormal) {
 TEST(device_handler, DevPermissionsMatchPrefix) {
     // Prefix from ueventd.rc
     // /dev/dri/*                0666   root       graphics
-    Permissions permissions("/dev/dri/*", 0666, 0, 1000);
+    Permissions permissions("/dev/dri/*", 0666, 0, 1000, false);
     EXPECT_TRUE(permissions.Match("/dev/dri/some_dri_device"));
     EXPECT_TRUE(permissions.Match("/dev/dri/some_other_dri_device"));
     EXPECT_TRUE(permissions.Match("/dev/dri/"));
@@ -366,7 +246,7 @@ TEST(device_handler, DevPermissionsMatchPrefix) {
 TEST(device_handler, DevPermissionsMatchWildcard) {
     // Wildcard example
     // /dev/device*name                0666   root       graphics
-    Permissions permissions("/dev/device*name", 0666, 0, 1000);
+    Permissions permissions("/dev/device*name", 0666, 0, 1000, false);
     EXPECT_TRUE(permissions.Match("/dev/devicename"));
     EXPECT_TRUE(permissions.Match("/dev/device123name"));
     EXPECT_TRUE(permissions.Match("/dev/deviceabcname"));
@@ -380,13 +260,31 @@ TEST(device_handler, DevPermissionsMatchWildcard) {
 TEST(device_handler, DevPermissionsMatchWildcardPrefix) {
     // Wildcard+Prefix example
     // /dev/device*name*                0666   root       graphics
-    Permissions permissions("/dev/device*name*", 0666, 0, 1000);
+    Permissions permissions("/dev/device*name*", 0666, 0, 1000, false);
     EXPECT_TRUE(permissions.Match("/dev/devicename"));
     EXPECT_TRUE(permissions.Match("/dev/device123name"));
     EXPECT_TRUE(permissions.Match("/dev/deviceabcname"));
     EXPECT_TRUE(permissions.Match("/dev/device123namesomething"));
     // FNM_PATHNAME doesn't match '/' with *
     EXPECT_FALSE(permissions.Match("/dev/device123name/something"));
+    EXPECT_FALSE(permissions.Match("/dev/device/1/2/3name/something"));
+    EXPECT_FALSE(permissions.Match("/dev/deviceame"));
+    EXPECT_EQ(0666U, permissions.perm());
+    EXPECT_EQ(0U, permissions.uid());
+    EXPECT_EQ(1000U, permissions.gid());
+}
+
+TEST(device_handler, DevPermissionsMatchWildcardPrefix_NoFnmPathName) {
+    // Wildcard+Prefix example with no_fnm_pathname
+    // /dev/device*name*                0666   root       graphics
+    Permissions permissions("/dev/device*name*", 0666, 0, 1000, true);
+    EXPECT_TRUE(permissions.Match("/dev/devicename"));
+    EXPECT_TRUE(permissions.Match("/dev/device123name"));
+    EXPECT_TRUE(permissions.Match("/dev/deviceabcname"));
+    EXPECT_TRUE(permissions.Match("/dev/device123namesomething"));
+    // With NoFnmPathName, the below matches, unlike DevPermissionsMatchWildcardPrefix.
+    EXPECT_TRUE(permissions.Match("/dev/device123name/something"));
+    EXPECT_TRUE(permissions.Match("/dev/device/1/2/3name/something"));
     EXPECT_FALSE(permissions.Match("/dev/deviceame"));
     EXPECT_EQ(0666U, permissions.perm());
     EXPECT_EQ(0U, permissions.uid());
@@ -395,7 +293,8 @@ TEST(device_handler, DevPermissionsMatchWildcardPrefix) {
 
 TEST(device_handler, SysfsPermissionsMatchWithSubsystemNormal) {
     // /sys/devices/virtual/input/input*   enable      0660  root   input
-    SysfsPermissions permissions("/sys/devices/virtual/input/input*", "enable", 0660, 0, 1001);
+    SysfsPermissions permissions("/sys/devices/virtual/input/input*", "enable", 0660, 0, 1001,
+                                 false);
     EXPECT_TRUE(permissions.MatchWithSubsystem("/sys/devices/virtual/input/input0", "input"));
     EXPECT_FALSE(permissions.MatchWithSubsystem("/sys/devices/virtual/input/not_input0", "input"));
     EXPECT_EQ(0660U, permissions.perm());
@@ -405,7 +304,7 @@ TEST(device_handler, SysfsPermissionsMatchWithSubsystemNormal) {
 
 TEST(device_handler, SysfsPermissionsMatchWithSubsystemClass) {
     // /sys/class/input/event*   enable      0660  root   input
-    SysfsPermissions permissions("/sys/class/input/event*", "enable", 0660, 0, 1001);
+    SysfsPermissions permissions("/sys/class/input/event*", "enable", 0660, 0, 1001, false);
     EXPECT_TRUE(permissions.MatchWithSubsystem(
         "/sys/devices/soc.0/f9924000.i2c/i2c-2/2-0020/input/input0/event0", "input"));
     EXPECT_FALSE(permissions.MatchWithSubsystem(
@@ -419,7 +318,7 @@ TEST(device_handler, SysfsPermissionsMatchWithSubsystemClass) {
 
 TEST(device_handler, SysfsPermissionsMatchWithSubsystemBus) {
     // /sys/bus/i2c/devices/i2c-*   enable      0660  root   input
-    SysfsPermissions permissions("/sys/bus/i2c/devices/i2c-*", "enable", 0660, 0, 1001);
+    SysfsPermissions permissions("/sys/bus/i2c/devices/i2c-*", "enable", 0660, 0, 1001, false);
     EXPECT_TRUE(permissions.MatchWithSubsystem("/sys/devices/soc.0/f9967000.i2c/i2c-5", "i2c"));
     EXPECT_FALSE(permissions.MatchWithSubsystem("/sys/devices/soc.0/f9967000.i2c/not-i2c", "i2c"));
     EXPECT_FALSE(
@@ -428,3 +327,6 @@ TEST(device_handler, SysfsPermissionsMatchWithSubsystemBus) {
     EXPECT_EQ(0U, permissions.uid());
     EXPECT_EQ(1001U, permissions.gid());
 }
+
+}  // namespace init
+}  // namespace android

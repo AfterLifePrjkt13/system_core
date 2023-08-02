@@ -15,6 +15,35 @@
 #include <random>
 #include <unordered_map>
 
+/* These deprecated declarations were in the legacy android/sync.h. They've been removed to
+ * encourage code to move to the modern equivalents. But they are still implemented in libsync.so
+ * to avoid breaking existing binaries; as long as that's true we should keep testing them here.
+ * That means making local copies of the declarations.
+ */
+extern "C" {
+
+struct sync_fence_info_data {
+    uint32_t len;
+    char name[32];
+    int32_t status;
+    uint8_t pt_info[0];
+};
+
+struct sync_pt_info {
+    uint32_t len;
+    char obj_name[32];
+    char driver_name[32];
+    int32_t status;
+    uint64_t timestamp_ns;
+    uint8_t driver_data[0];
+};
+
+struct sync_fence_info_data* sync_fence_info(int fd);
+struct sync_pt_info* sync_pt_info(struct sync_fence_info_data* info, struct sync_pt_info* itr);
+void sync_fence_info_free(struct sync_fence_info_data* info);
+
+}  // extern "C"
+
 // TODO: better stress tests?
 // Handle more than 64 fd's simultaneously, i.e. fix sync_fence_info's 4k limit.
 // Handle wraparound in timelines like nvidia.
@@ -446,6 +475,41 @@ TEST(FenceTest, MultiTimelineWait) {
 
     // confirm you can successfully wait.
     ASSERT_EQ(mergedFence.wait(100), 0);
+}
+
+TEST(FenceTest, GetInfoActive) {
+    SyncTimeline timeline;
+    ASSERT_TRUE(timeline.isValid());
+
+    SyncFence fence(timeline, 1);
+    ASSERT_TRUE(fence.isValid());
+
+    vector<SyncPointInfo> info = fence.getInfo();
+    ASSERT_EQ(info.size(), 1);
+
+    ASSERT_FALSE(info[0].driverName.empty());
+    ASSERT_FALSE(info[0].objectName.empty());
+    ASSERT_EQ(info[0].timeStampNs, 0);
+    ASSERT_EQ(info[0].status, 0);
+}
+
+TEST(FenceTest, GetInfoSignaled) {
+    SyncTimeline timeline;
+    ASSERT_TRUE(timeline.isValid());
+
+    SyncFence fence(timeline, 1);
+    ASSERT_TRUE(fence.isValid());
+
+    ASSERT_EQ(timeline.inc(1), 0);
+    ASSERT_EQ(fence.wait(), 0);
+
+    vector<SyncPointInfo> info = fence.getInfo();
+    ASSERT_EQ(info.size(), 1);
+
+    ASSERT_FALSE(info[0].driverName.empty());
+    ASSERT_FALSE(info[0].objectName.empty());
+    ASSERT_GT(info[0].timeStampNs, 0);
+    ASSERT_EQ(info[0].status, 1);
 }
 
 TEST(StressTest, TwoThreadsSharedTimeline) {

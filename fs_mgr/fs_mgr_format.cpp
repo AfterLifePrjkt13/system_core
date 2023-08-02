@@ -24,120 +24,152 @@
 #include <cutils/partition_utils.h>
 #include <sys/mount.h>
 
-#include <ext4_utils/ext4_utils.h>
+#include <android-base/properties.h>
+#include <android-base/unique_fd.h>
 #include <ext4_utils/ext4.h>
-#include <ext4_utils/make_ext4fs.h>
-#include <selinux/selinux.h>
-#include <selinux/label.h>
+#include <ext4_utils/ext4_utils.h>
+#include <logwrap/logwrap.h>
 #include <selinux/android.h>
+#include <selinux/label.h>
+#include <selinux/selinux.h>
 
 #include "fs_mgr_priv.h"
-#include "cryptfs.h"
 
-extern "C" {
-extern struct fs_info info;     /* magic global from ext4_utils */
-extern void reset_ext4fs_info();
-}
+using android::base::unique_fd;
 
-static int format_ext4(char *fs_blkdev, char *fs_mnt_point, bool crypt_footer)
-{
-    uint64_t dev_sz;
-    int fd, rc = 0;
+// Realistically, this file should be part of the android::fs_mgr namespace;
+using namespace android::fs_mgr;
 
-    if ((fd = open(fs_blkdev, O_WRONLY)) < 0) {
+static int get_dev_sz(const std::string& fs_blkdev, uint64_t* dev_sz) {
+    unique_fd fd(TEMP_FAILURE_RETRY(open(fs_blkdev.c_str(), O_RDONLY | O_CLOEXEC)));
+
+    if (fd < 0) {
         PERROR << "Cannot open block device";
         return -1;
     }
 
-    if ((ioctl(fd, BLKGETSIZE64, &dev_sz)) == -1) {
+    if ((ioctl(fd, BLKGETSIZE64, dev_sz)) == -1) {
         PERROR << "Cannot get block device size";
-        close(fd);
         return -1;
     }
 
-    struct selabel_handle *sehandle = selinux_android_file_context_handle();
-    if (!sehandle) {
-        /* libselinux logs specific error */
-        LERROR << "Cannot initialize android file_contexts";
-        close(fd);
-        return -1;
+    return 0;
+}
+
+static int format_ext4(const std::string& fs_blkdev, const std::string& fs_mnt_point,
+                       bool needs_projid, bool needs_metadata_csum) {
+    uint64_t dev_sz;
+    int rc = 0;
+
+    rc = get_dev_sz(fs_blkdev, &dev_sz);
+    if (rc) {
+        return rc;
     }
 
     /* Format the partition using the calculated length */
-    reset_ext4fs_info();
-    info.len = (off64_t)dev_sz;
-    if (crypt_footer) {
-        info.len -= CRYPT_FOOTER_OFFSET;
+
+    std::string size_str = std::to_string(dev_sz / 4096);
+
+    std::vector<const char*> mke2fs_args = {"/system/bin/mke2fs", "-t", "ext4", "-b", "4096"};
+
+    // Project ID's require wider inodes. The Quotas themselves are enabled by tune2fs during boot.
+    if (needs_projid) {
+        mke2fs_args.push_back("-I");
+        mke2fs_args.push_back("512");
+    }
+    // casefolding is enabled via tune2fs during boot.
+
+    if (needs_metadata_csum) {
+        mke2fs_args.push_back("-O");
+        mke2fs_args.push_back("metadata_csum");
+        // tune2fs recommends to enable 64bit and extent:
+        //  Extents are not enabled.  The file extent tree can be checksummed,
+        //  whereas block maps cannot. Not enabling extents reduces the coverage
+        //  of metadata checksumming.  Re-run with -O extent to rectify.
+        //  64-bit filesystem support is not enabled.  The larger fields afforded
+        //  by this feature enable full-strength checksumming.  Run resize2fs -b to rectify.
+        mke2fs_args.push_back("-O");
+        mke2fs_args.push_back("64bit");
+        mke2fs_args.push_back("-O");
+        mke2fs_args.push_back("extent");
     }
 
-    /* Use make_ext4fs_internal to avoid wiping an already-wiped partition. */
-    rc = make_ext4fs_internal(fd, NULL, NULL, fs_mnt_point, 0, 0, 0, 0, 0, 0, sehandle, 0, 0, NULL, NULL, NULL);
+    mke2fs_args.push_back(fs_blkdev.c_str());
+    mke2fs_args.push_back(size_str.c_str());
+
+    rc = logwrap_fork_execvp(mke2fs_args.size(), mke2fs_args.data(), nullptr, false, LOG_KLOG,
+                             false, nullptr);
     if (rc) {
-        LERROR << "make_ext4fs returned " << rc;
-    }
-    close(fd);
-
-    if (sehandle) {
-        selabel_close(sehandle);
+        LERROR << "mke2fs returned " << rc;
+        return rc;
     }
 
-    return rc;
-}
+    const char* const e2fsdroid_args[] = {
+            "/system/bin/e2fsdroid", "-e", "-a", fs_mnt_point.c_str(), fs_blkdev.c_str(), nullptr};
 
-static int format_f2fs(char *fs_blkdev)
-{
-    char * args[3];
-    int pid;
-    int rc = 0;
-
-    args[0] = (char *)"/sbin/mkfs.f2fs";
-    args[1] = fs_blkdev;
-    args[2] = (char *)0;
-
-    pid = fork();
-    if (pid < 0) {
-       return pid;
-    }
-    if (!pid) {
-        /* This doesn't return */
-        execv("/sbin/mkfs.f2fs", args);
-        exit(1);
-    }
-    for(;;) {
-        pid_t p = waitpid(pid, &rc, 0);
-        if (p != pid) {
-            LERROR << "Error waiting for child process - " << p;
-            rc = -1;
-            break;
-        }
-        if (WIFEXITED(rc)) {
-            rc = WEXITSTATUS(rc);
-            LINFO << args[0] << " done, status " << rc;
-            if (rc) {
-                rc = -1;
-            }
-            break;
-        }
-        LERROR << "Still waiting for " << args[0] << "...";
+    rc = logwrap_fork_execvp(arraysize(e2fsdroid_args), e2fsdroid_args, nullptr, false, LOG_KLOG,
+                             false, nullptr);
+    if (rc) {
+        LERROR << "e2fsdroid returned " << rc;
     }
 
     return rc;
 }
 
-int fs_mgr_do_format(struct fstab_rec *fstab, bool crypt_footer)
-{
-    int rc = -EINVAL;
+static int format_f2fs(const std::string& fs_blkdev, uint64_t dev_sz, bool needs_projid,
+                       bool needs_casefold, bool fs_compress) {
+    if (!dev_sz) {
+        int rc = get_dev_sz(fs_blkdev, &dev_sz);
+        if (rc) {
+            return rc;
+        }
+    }
 
-    LERROR << __FUNCTION__ << ": Format " << fstab->blk_device
-           << " as '" << fstab->fs_type << "'";
+    /* Format the partition using the calculated length */
 
-    if (!strncmp(fstab->fs_type, "f2fs", 4)) {
-        rc = format_f2fs(fstab->blk_device);
-    } else if (!strncmp(fstab->fs_type, "ext4", 4)) {
-        rc = format_ext4(fstab->blk_device, fstab->mount_point, crypt_footer);
+    std::string size_str = std::to_string(dev_sz / 4096);
+
+    std::vector<const char*> args = {"/system/bin/make_f2fs", "-g", "android"};
+    if (needs_projid) {
+        args.push_back("-O");
+        args.push_back("project_quota,extra_attr");
+    }
+    if (needs_casefold) {
+        args.push_back("-O");
+        args.push_back("casefold");
+        args.push_back("-C");
+        args.push_back("utf8");
+    }
+    if (fs_compress) {
+        args.push_back("-O");
+        args.push_back("compression");
+        args.push_back("-O");
+        args.push_back("extra_attr");
+    }
+    args.push_back(fs_blkdev.c_str());
+    args.push_back(size_str.c_str());
+
+    return logwrap_fork_execvp(args.size(), args.data(), nullptr, false, LOG_KLOG, false, nullptr);
+}
+
+int fs_mgr_do_format(const FstabEntry& entry) {
+    LERROR << __FUNCTION__ << ": Format " << entry.blk_device << " as '" << entry.fs_type << "'";
+
+    bool needs_casefold = false;
+    bool needs_projid = true;
+
+    if (entry.mount_point == "/data") {
+        needs_casefold = android::base::GetBoolProperty("external_storage.casefold.enabled", false);
+    }
+
+    if (entry.fs_type == "f2fs") {
+        return format_f2fs(entry.blk_device, entry.length, needs_projid, needs_casefold,
+                           entry.fs_mgr_flags.fs_compress);
+    } else if (entry.fs_type == "ext4") {
+        return format_ext4(entry.blk_device, entry.mount_point, needs_projid,
+                           entry.fs_mgr_flags.ext_meta_csum);
     } else {
-        LERROR << "File system type '" << fstab->fs_type << "' is not supported";
+        LERROR << "File system type '" << entry.fs_type << "' is not supported";
+        return -EINVAL;
     }
-
-    return rc;
 }

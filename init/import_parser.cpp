@@ -20,33 +20,37 @@
 
 #include "util.h"
 
-bool ImportParser::ParseSection(std::vector<std::string>&& args, const std::string& filename,
-                                int line, std::string* err) {
+namespace android {
+namespace init {
+
+Result<void> ImportParser::ParseSection(std::vector<std::string>&& args,
+                                        const std::string& filename, int line) {
     if (args.size() != 2) {
-        *err = "single argument needed for import\n";
-        return false;
+        return Error() << "single argument needed for import\n";
     }
 
-    std::string conf_file;
-    bool ret = expand_props(args[1], &conf_file);
-    if (!ret) {
-        *err = "error while expanding import";
-        return false;
+    auto conf_file = ExpandProps(args[1]);
+    if (!conf_file.ok()) {
+        return Error() << "Could not expand import: " << conf_file.error();
     }
 
-    LOG(INFO) << "Added '" << conf_file << "' to import list";
+    LOG(INFO) << "Added '" << *conf_file << "' to import list";
     if (filename_.empty()) filename_ = filename;
-    imports_.emplace_back(std::move(conf_file), line);
-    return true;
+    imports_.emplace_back(std::move(*conf_file), line);
+    return {};
+}
+
+Result<void> ImportParser::ParseLineSection(std::vector<std::string>&&, int) {
+    return Error() << "Unexpected line found after import statement";
 }
 
 void ImportParser::EndFile() {
     auto current_imports = std::move(imports_);
     imports_.clear();
     for (const auto& [import, line_num] : current_imports) {
-        if (!parser_->ParseConfig(import)) {
-            PLOG(ERROR) << filename_ << ": " << line_num << ": Could not import file '" << import
-                        << "'";
-        }
+        parser_->ParseConfig(import);
     }
 }
+
+}  // namespace init
+}  // namespace android

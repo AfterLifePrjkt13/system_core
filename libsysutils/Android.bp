@@ -1,6 +1,14 @@
-cc_library_shared {
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
+cc_library {
     name: "libsysutils",
+    recovery_available: true,
     vendor_available: true,
+    vndk: {
+        enabled: true,
+    },
 
     srcs: [
         "src/SocketListener.cpp",
@@ -20,8 +28,38 @@ cc_library_shared {
         "libbase",
         "libcutils",
         "liblog",
-        "libnl",
     ],
 
     export_include_dirs: ["include"],
+
+    tidy: true,
+    tidy_checks: [
+        "-*",
+        "cert-*",
+        "clang-analyzer-security*",
+        "android-*",
+    ],
+    tidy_checks_as_errors: [
+        "cert-*",
+        "clang-analyzer-security*",
+        "android-*",
+    ],
+    apex_available: [
+        "//apex_available:anyapex",
+        "//apex_available:platform",
+    ],
+    min_sdk_version: "apex_inherit",
+}
+
+cc_test {
+    name: "libsysutils_tests",
+    test_suites: ["device-tests"],
+    srcs: [
+        "src/SocketListener_test.cpp",
+    ],
+    shared_libs: [
+        "libbase",
+        "libcutils",
+        "libsysutils",
+    ],
 }

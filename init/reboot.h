@@ -17,19 +17,22 @@
 #ifndef _INIT_REBOOT_H
 #define _INIT_REBOOT_H
 
+#include <chrono>
+#include <set>
 #include <string>
 
-/* Reboot / shutdown the system.
- * cmd ANDROID_RB_* as defined in android_reboot.h
- * reason Reason string like "reboot", "userrequested"
- * rebootTarget Reboot target string like "bootloader". Otherwise, it should be an
- *              empty string.
- * runFsck Whether to run fsck after umount is done.
- */
-void DoReboot(unsigned int cmd, const std::string& reason, const std::string& rebootTarget,
-              bool runFsck) __attribute__((__noreturn__));
+namespace android {
+namespace init {
 
+// Like StopServices, but also logs all the services that failed to stop after the provided timeout.
+// Returns number of violators.
+int StopServicesAndLogViolations(const std::set<std::string>& services,
+                                 std::chrono::milliseconds timeout, bool terminate);
 // Parses and handles a setprop sys.powerctl message.
-bool HandlePowerctlMessage(const std::string& command);
+void HandlePowerctlMessage(const std::string& command);
+
+bool IsShuttingDown();
+}  // namespace init
+}  // namespace android
 
 #endif

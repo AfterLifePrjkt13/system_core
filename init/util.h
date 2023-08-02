@@ -14,68 +14,96 @@
  * limitations under the License.
  */
 
-#ifndef _INIT_UTIL_H_
-#define _INIT_UTIL_H_
+#pragma once
 
 #include <sys/stat.h>
 #include <sys/types.h>
 
 #include <chrono>
 #include <functional>
-#include <ostream>
 #include <string>
+#include <vector>
 
 #include <android-base/chrono_utils.h>
-#include <selinux/label.h>
 
-#define COLDBOOT_DONE "/dev/.coldboot_done"
-
-const std::string kAndroidDtDir("/proc/device-tree/firmware/android/");
+#include "fscrypt_init_extensions.h"
+#include "result.h"
 
 using android::base::boot_clock;
-using namespace std::chrono_literals;
 
-int CreateSocket(const char* name, int type, bool passcred, mode_t perm, uid_t uid, gid_t gid,
-                 const char* socketcon, selabel_handle* sehandle);
+namespace android {
+namespace init {
 
-bool ReadFile(const std::string& path, std::string* content, std::string* err);
-bool WriteFile(const std::string& path, const std::string& content, std::string* err);
-
-class Timer {
-  public:
-    Timer() : start_(boot_clock::now()) {}
-
-    double duration_s() const {
-        typedef std::chrono::duration<double> double_duration;
-        return std::chrono::duration_cast<double_duration>(boot_clock::now() - start_).count();
-    }
-
-    int64_t duration_ms() const {
-        return std::chrono::duration_cast<std::chrono::milliseconds>(boot_clock::now() - start_)
-            .count();
-    }
-
-  private:
-    android::base::boot_clock::time_point start_;
+enum mount_mode {
+    MOUNT_MODE_DEFAULT = 0,
+    MOUNT_MODE_EARLY = 1,
+    MOUNT_MODE_LATE = 2,
 };
 
-std::ostream& operator<<(std::ostream& os, const Timer& t);
+static const char kColdBootDoneProp[] = "ro.cold_boot_done";
 
-bool DecodeUid(const std::string& name, uid_t* uid, std::string* err);
+extern void (*trigger_shutdown)(const std::string& command);
 
-int mkdir_recursive(const std::string& pathname, mode_t mode, selabel_handle* sehandle);
+Result<int> CreateSocket(const std::string& name, int type, bool passcred, bool should_listen,
+                         mode_t perm, uid_t uid, gid_t gid, const std::string& socketcon);
+
+Result<std::string> ReadFile(const std::string& path);
+Result<void> WriteFile(const std::string& path, const std::string& content);
+
+Result<uid_t> DecodeUid(const std::string& name);
+
+bool mkdir_recursive(const std::string& pathname, mode_t mode);
 int wait_for_file(const char *filename, std::chrono::nanoseconds timeout);
-void import_kernel_cmdline(bool in_qemu,
-                           const std::function<void(const std::string&, const std::string&, bool)>&);
-int make_dir(const char* path, mode_t mode, selabel_handle* sehandle);
-std::string bytes_to_hex(const uint8_t *bytes, size_t bytes_len);
+void ImportKernelCmdline(const std::function<void(const std::string&, const std::string&)>&);
+void ImportBootconfig(const std::function<void(const std::string&, const std::string&)>&);
+bool make_dir(const std::string& path, mode_t mode);
 bool is_dir(const char* pathname);
-bool expand_props(const std::string& src, std::string* dst);
+Result<std::string> ExpandProps(const std::string& src);
 
-void panic() __attribute__((__noreturn__));
-
-// Reads or compares the content of device tree file under kAndroidDtDir directory.
+// Returns the platform's Android DT directory as specified in the kernel cmdline.
+// If the platform does not configure a custom DT path, returns the standard one (based in procfs).
+const std::string& get_android_dt_dir();
+// Reads or compares the content of device tree file under the platform's Android DT directory.
 bool read_android_dt_file(const std::string& sub_path, std::string* dt_content);
 bool is_android_dt_value_expected(const std::string& sub_path, const std::string& expected_content);
 
-#endif
+bool IsLegalPropertyName(const std::string& name);
+Result<void> IsLegalPropertyValue(const std::string& name, const std::string& value);
+
+struct MkdirOptions {
+    std::string target;
+    mode_t mode;
+    uid_t uid;
+    gid_t gid;
+    FscryptAction fscrypt_action;
+    std::string ref_option;
+};
+
+Result<MkdirOptions> ParseMkdir(const std::vector<std::string>& args);
+
+struct MountAllOptions {
+    std::vector<std::string> rc_paths;
+    std::string fstab_path;
+    mount_mode mode;
+    bool import_rc;
+};
+
+Result<MountAllOptions> ParseMountAll(const std::vector<std::string>& args);
+
+Result<std::pair<int, std::vector<std::string>>> ParseRestorecon(
+        const std::vector<std::string>& args);
+
+Result<std::string> ParseSwaponAll(const std::vector<std::string>& args);
+
+Result<std::string> ParseUmountAll(const std::vector<std::string>& args);
+
+void SetStdioToDevNull(char** argv);
+void InitKernelLogging(char** argv);
+bool IsRecoveryMode();
+
+bool IsDefaultMountNamespaceReady();
+void SetDefaultMountNamespaceReady();
+
+bool IsMicrodroid();
+}  // namespace init
+}  // namespace android

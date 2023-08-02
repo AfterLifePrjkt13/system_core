@@ -16,913 +16,535 @@
 
 #include "init.h"
 
-#include <ctype.h>
 #include <dirent.h>
-#include <errno.h>
 #include <fcntl.h>
-#include <inttypes.h>
-#include <libgen.h>
 #include <paths.h>
+#include <pthread.h>
 #include <signal.h>
-#include <stdarg.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/mount.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
-#include <sys/sysmacros.h>
+#include <sys/signalfd.h>
 #include <sys/types.h>
-#include <sys/un.h>
-#include <sys/wait.h>
+#include <sys/utsname.h>
 #include <unistd.h>
+
+#define _REALLY_INCLUDE_SYS__SYSTEM_PROPERTIES_H_
+#include <sys/_system_properties.h>
+
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <iostream>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <thread>
+#include <vector>
 
 #include <android-base/chrono_utils.h>
 #include <android-base/file.h>
 #include <android-base/logging.h>
+#include <android-base/parseint.h>
 #include <android-base/properties.h>
 #include <android-base/stringprintf.h>
 #include <android-base/strings.h>
-#include <android-base/unique_fd.h>
+#include <backtrace/Backtrace.h>
+#include <fs_avb/fs_avb.h>
+#include <fs_mgr_vendor_overlay.h>
 #include <keyutils.h>
 #include <libavb/libavb.h>
-#include <private/android_filesystem_config.h>
+#include <libgsi/libgsi.h>
+#include <libsnapshot/snapshot.h>
+#include <processgroup/processgroup.h>
+#include <processgroup/setup.h>
 #include <selinux/android.h>
-#include <selinux/label.h>
-#include <selinux/selinux.h>
 
-#include <fstream>
-#include <memory>
-#include <vector>
-
-#include "action.h"
-#include "bootchart.h"
+#include "action_parser.h"
+#include "builtins.h"
+#include "epoll.h"
+#include "first_stage_init.h"
+#include "first_stage_mount.h"
 #include "import_parser.h"
-#include "init_first_stage.h"
-#include "init_parser.h"
 #include "keychords.h"
-#include "log.h"
+#include "lmkd_service.h"
+#include "mount_handler.h"
+#include "mount_namespace.h"
 #include "property_service.h"
+#include "proto_utils.h"
 #include "reboot.h"
+#include "reboot_utils.h"
+#include "second_stage_resources.h"
+#include "security.h"
+#include "selabel.h"
+#include "selinux.h"
 #include "service.h"
-#include "signal_handler.h"
-#include "ueventd.h"
+#include "service_parser.h"
+#include "sigchld_handler.h"
+#include "snapuserd_transition.h"
+#include "subcontext.h"
+#include "system/core/init/property_service.pb.h"
 #include "util.h"
-#include "watchdogd.h"
+
+using namespace std::chrono_literals;
+using namespace std::string_literals;
 
 using android::base::boot_clock;
+using android::base::ConsumePrefix;
 using android::base::GetProperty;
+using android::base::ReadFileToString;
+using android::base::SetProperty;
 using android::base::StringPrintf;
+using android::base::Timer;
+using android::base::Trim;
+using android::fs_mgr::AvbHandle;
+using android::snapshot::SnapshotManager;
 
-struct selabel_handle *sehandle;
-struct selabel_handle *sehandle_prop;
+namespace android {
+namespace init {
 
 static int property_triggers_enabled = 0;
 
-static char qemu[32];
+static int signal_fd = -1;
+static int property_fd = -1;
 
-std::string default_console = "/dev/console";
-static time_t process_needs_restart_at;
+struct PendingControlMessage {
+    std::string message;
+    std::string name;
+    pid_t pid;
+    int fd;
+};
+static std::mutex pending_control_messages_lock;
+static std::queue<PendingControlMessage> pending_control_messages;
 
-const char *ENV[32];
+// Init epolls various FDs to wait for various inputs.  It previously waited on property changes
+// with a blocking socket that contained the information related to the change, however, it was easy
+// to fill that socket and deadlock the system.  Now we use locks to handle the property changes
+// directly in the property thread, however we still must wake the epoll to inform init that there
+// is a change to process, so we use this FD.  It is non-blocking, since we do not care how many
+// times WakeMainInitThread() is called, only that the epoll will wake.
+static int wake_main_thread_fd = -1;
+static void InstallInitNotifier(Epoll* epoll) {
+    wake_main_thread_fd = eventfd(0, EFD_CLOEXEC);
+    if (wake_main_thread_fd == -1) {
+        PLOG(FATAL) << "Failed to create eventfd for waking init";
+    }
+    auto clear_eventfd = [] {
+        uint64_t counter;
+        TEMP_FAILURE_RETRY(read(wake_main_thread_fd, &counter, sizeof(counter)));
+    };
 
-static int epoll_fd = -1;
+    if (auto result = epoll->RegisterHandler(wake_main_thread_fd, clear_eventfd); !result.ok()) {
+        LOG(FATAL) << result.error();
+    }
+}
 
-static std::unique_ptr<Timer> waiting_for_prop(nullptr);
-static std::string wait_prop_name;
-static std::string wait_prop_value;
+static void WakeMainInitThread() {
+    uint64_t counter = 1;
+    TEMP_FAILURE_RETRY(write(wake_main_thread_fd, &counter, sizeof(counter)));
+}
+
+static class PropWaiterState {
+  public:
+    bool StartWaiting(const char* name, const char* value) {
+        auto lock = std::lock_guard{lock_};
+        if (waiting_for_prop_) {
+            return false;
+        }
+        if (GetProperty(name, "") != value) {
+            // Current property value is not equal to expected value
+            wait_prop_name_ = name;
+            wait_prop_value_ = value;
+            waiting_for_prop_.reset(new Timer());
+        } else {
+            LOG(INFO) << "start_waiting_for_property(\"" << name << "\", \"" << value
+                      << "\"): already set";
+        }
+        return true;
+    }
+
+    void ResetWaitForProp() {
+        auto lock = std::lock_guard{lock_};
+        ResetWaitForPropLocked();
+    }
+
+    void CheckAndResetWait(const std::string& name, const std::string& value) {
+        auto lock = std::lock_guard{lock_};
+        // We always record how long init waited for ueventd to tell us cold boot finished.
+        // If we aren't waiting on this property, it means that ueventd finished before we even
+        // started to wait.
+        if (name == kColdBootDoneProp) {
+            auto time_waited = waiting_for_prop_ ? waiting_for_prop_->duration().count() : 0;
+            std::thread([time_waited] {
+                SetProperty("ro.boottime.init.cold_boot_wait", std::to_string(time_waited));
+            }).detach();
+        }
+
+        if (waiting_for_prop_) {
+            if (wait_prop_name_ == name && wait_prop_value_ == value) {
+                LOG(INFO) << "Wait for property '" << wait_prop_name_ << "=" << wait_prop_value_
+                          << "' took " << *waiting_for_prop_;
+                ResetWaitForPropLocked();
+                WakeMainInitThread();
+            }
+        }
+    }
+
+    // This is not thread safe because it releases the lock when it returns, so the waiting state
+    // may change.  However, we only use this function to prevent running commands in the main
+    // thread loop when we are waiting, so we do not care about false positives; only false
+    // negatives.  StartWaiting() and this function are always called from the same thread, so false
+    // negatives are not possible and therefore we're okay.
+    bool MightBeWaiting() {
+        auto lock = std::lock_guard{lock_};
+        return static_cast<bool>(waiting_for_prop_);
+    }
+
+  private:
+    void ResetWaitForPropLocked() {
+        wait_prop_name_.clear();
+        wait_prop_value_.clear();
+        waiting_for_prop_.reset();
+    }
+
+    std::mutex lock_;
+    std::unique_ptr<Timer> waiting_for_prop_{nullptr};
+    std::string wait_prop_name_;
+    std::string wait_prop_value_;
+
+} prop_waiter_state;
+
+bool start_waiting_for_property(const char* name, const char* value) {
+    return prop_waiter_state.StartWaiting(name, value);
+}
+
+void ResetWaitForProp() {
+    prop_waiter_state.ResetWaitForProp();
+}
+
+static class ShutdownState {
+  public:
+    void TriggerShutdown(const std::string& command) {
+        // We can't call HandlePowerctlMessage() directly in this function,
+        // because it modifies the contents of the action queue, which can cause the action queue
+        // to get into a bad state if this function is called from a command being executed by the
+        // action queue.  Instead we set this flag and ensure that shutdown happens before the next
+        // command is run in the main init loop.
+        auto lock = std::lock_guard{shutdown_command_lock_};
+        shutdown_command_ = command;
+        do_shutdown_ = true;
+        WakeMainInitThread();
+    }
+
+    std::optional<std::string> CheckShutdown() {
+        auto lock = std::lock_guard{shutdown_command_lock_};
+        if (do_shutdown_ && !IsShuttingDown()) {
+            return shutdown_command_;
+        }
+        return {};
+    }
+
+    bool do_shutdown() const { return do_shutdown_; }
+    void set_do_shutdown(bool value) { do_shutdown_ = value; }
+
+  private:
+    std::mutex shutdown_command_lock_;
+    std::string shutdown_command_;
+    bool do_shutdown_ = false;
+} shutdown_state;
+
+static void UnwindMainThreadStack() {
+    std::unique_ptr<Backtrace> backtrace(Backtrace::Create(BACKTRACE_CURRENT_PROCESS, 1));
+    if (!backtrace->Unwind(0)) {
+        LOG(ERROR) << __FUNCTION__ << "sys.powerctl: Failed to unwind callstack.";
+    }
+    for (size_t i = 0; i < backtrace->NumFrames(); i++) {
+        LOG(ERROR) << "sys.powerctl: " << backtrace->FormatFrameData(i);
+    }
+}
+
+void DebugRebootLogging() {
+    LOG(INFO) << "sys.powerctl: do_shutdown: " << shutdown_state.do_shutdown()
+              << " IsShuttingDown: " << IsShuttingDown();
+    if (shutdown_state.do_shutdown()) {
+        LOG(ERROR) << "sys.powerctl set while a previous shutdown command has not been handled";
+        UnwindMainThreadStack();
+    }
+    if (IsShuttingDown()) {
+        LOG(ERROR) << "sys.powerctl set while init is already shutting down";
+        UnwindMainThreadStack();
+    }
+}
 
 void DumpState() {
-    ServiceManager::GetInstance().DumpState();
+    ServiceList::GetInstance().DumpState();
     ActionManager::GetInstance().DumpState();
 }
 
-void register_epoll_handler(int fd, void (*fn)()) {
-    epoll_event ev;
-    ev.events = EPOLLIN;
-    ev.data.ptr = reinterpret_cast<void*>(fn);
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ev) == -1) {
-        PLOG(ERROR) << "epoll_ctl failed";
-    }
+Parser CreateParser(ActionManager& action_manager, ServiceList& service_list) {
+    Parser parser;
+
+    parser.AddSectionParser("service", std::make_unique<ServiceParser>(
+                                               &service_list, GetSubcontext(), std::nullopt));
+    parser.AddSectionParser("on", std::make_unique<ActionParser>(&action_manager, GetSubcontext()));
+    parser.AddSectionParser("import", std::make_unique<ImportParser>(&parser));
+
+    return parser;
 }
 
-/* add_environment - add "key=value" to the current environment */
-int add_environment(const char *key, const char *val)
-{
-    size_t n;
-    size_t key_len = strlen(key);
+// parser that only accepts new services
+Parser CreateServiceOnlyParser(ServiceList& service_list, bool from_apex) {
+    Parser parser;
 
-    /* The last environment entry is reserved to terminate the list */
-    for (n = 0; n < (arraysize(ENV) - 1); n++) {
-
-        /* Delete any existing entry for this key */
-        if (ENV[n] != NULL) {
-            size_t entry_key_len = strcspn(ENV[n], "=");
-            if ((entry_key_len == key_len) && (strncmp(ENV[n], key, entry_key_len) == 0)) {
-                free((char*)ENV[n]);
-                ENV[n] = NULL;
-            }
-        }
-
-        /* Add entry if a free slot is available */
-        if (ENV[n] == NULL) {
-            char* entry;
-            asprintf(&entry, "%s=%s", key, val);
-            ENV[n] = entry;
-            return 0;
-        }
-    }
-
-    LOG(ERROR) << "No env. room to store: '" << key << "':'" << val << "'";
-
-    return -1;
+    parser.AddSectionParser(
+            "service", std::make_unique<ServiceParser>(&service_list, GetSubcontext(), std::nullopt,
+                                                       from_apex));
+    return parser;
 }
 
-bool start_waiting_for_property(const char *name, const char *value)
-{
-    if (waiting_for_prop) {
-        return false;
-    }
-    if (GetProperty(name, "") != value) {
-        // Current property value is not equal to expected value
-        wait_prop_name = name;
-        wait_prop_value = value;
-        waiting_for_prop.reset(new Timer());
+static void LoadBootScripts(ActionManager& action_manager, ServiceList& service_list) {
+    Parser parser = CreateParser(action_manager, service_list);
+
+    std::string bootscript = GetProperty("ro.boot.init_rc", "");
+    if (bootscript.empty()) {
+        parser.ParseConfig("/system/etc/init/hw/init.rc");
+        if (!parser.ParseConfig("/system/etc/init")) {
+            late_import_paths.emplace_back("/system/etc/init");
+        }
+        // late_import is available only in Q and earlier release. As we don't
+        // have system_ext in those versions, skip late_import for system_ext.
+        parser.ParseConfig("/system_ext/etc/init");
+        if (!parser.ParseConfig("/vendor/etc/init")) {
+            late_import_paths.emplace_back("/vendor/etc/init");
+        }
+        if (!parser.ParseConfig("/odm/etc/init")) {
+            late_import_paths.emplace_back("/odm/etc/init");
+        }
+        if (!parser.ParseConfig("/product/etc/init")) {
+            late_import_paths.emplace_back("/product/etc/init");
+        }
     } else {
-        LOG(INFO) << "start_waiting_for_property(\""
-                  << name << "\", \"" << value << "\"): already set";
+        parser.ParseConfig(bootscript);
     }
-    return true;
 }
 
-void property_changed(const std::string& name, const std::string& value) {
+void PropertyChanged(const std::string& name, const std::string& value) {
     // If the property is sys.powerctl, we bypass the event queue and immediately handle it.
     // This is to ensure that init will always and immediately shutdown/reboot, regardless of
     // if there are other pending events to process or if init is waiting on an exec service or
     // waiting on a property.
-    if (name == "sys.powerctl") HandlePowerctlMessage(value);
+    // In non-thermal-shutdown case, 'shutdown' trigger will be fired to let device specific
+    // commands to be executed.
+    if (name == "sys.powerctl") {
+        trigger_shutdown(value);
+    }
 
-    if (property_triggers_enabled) ActionManager::GetInstance().QueuePropertyChange(name, value);
+    if (property_triggers_enabled) {
+        ActionManager::GetInstance().QueuePropertyChange(name, value);
+        WakeMainInitThread();
+    }
 
-    if (waiting_for_prop) {
-        if (wait_prop_name == name && wait_prop_value == value) {
-            wait_prop_name.clear();
-            wait_prop_value.clear();
-            LOG(INFO) << "Wait for property took " << *waiting_for_prop;
-            waiting_for_prop.reset();
+    prop_waiter_state.CheckAndResetWait(name, value);
+}
+
+static std::optional<boot_clock::time_point> HandleProcessActions() {
+    std::optional<boot_clock::time_point> next_process_action_time;
+    for (const auto& s : ServiceList::GetInstance()) {
+        if ((s->flags() & SVC_RUNNING) && s->timeout_period()) {
+            auto timeout_time = s->time_started() + *s->timeout_period();
+            if (boot_clock::now() > timeout_time) {
+                s->Timeout();
+            } else {
+                if (!next_process_action_time || timeout_time < *next_process_action_time) {
+                    next_process_action_time = timeout_time;
+                }
+            }
         }
-    }
-}
 
-static void restart_processes()
-{
-    process_needs_restart_at = 0;
-    ServiceManager::GetInstance().ForEachServiceWithFlags(SVC_RESTARTING, [](Service* s) {
-        s->RestartIfNeeded(&process_needs_restart_at);
-    });
-}
+        if (!(s->flags() & SVC_RESTARTING)) continue;
 
-void handle_control_message(const std::string& msg, const std::string& name) {
-    Service* svc = ServiceManager::GetInstance().FindServiceByName(name);
-    if (svc == nullptr) {
-        LOG(ERROR) << "no such service '" << name << "'";
-        return;
-    }
-
-    if (msg == "start") {
-        svc->Start();
-    } else if (msg == "stop") {
-        svc->Stop();
-    } else if (msg == "restart") {
-        svc->Restart();
-    } else {
-        LOG(ERROR) << "unknown control msg '" << msg << "'";
-    }
-}
-
-static int wait_for_coldboot_done_action(const std::vector<std::string>& args) {
-    Timer t;
-
-    LOG(VERBOSE) << "Waiting for " COLDBOOT_DONE "...";
-
-    // Historically we had a 1s timeout here because we weren't otherwise
-    // tracking boot time, and many OEMs made their sepolicy regular
-    // expressions too expensive (http://b/19899875).
-
-    // Now we're tracking boot time, just log the time taken to a system
-    // property. We still panic if it takes more than a minute though,
-    // because any build that slow isn't likely to boot at all, and we'd
-    // rather any test lab devices fail back to the bootloader.
-    if (wait_for_file(COLDBOOT_DONE, 60s) < 0) {
-        LOG(ERROR) << "Timed out waiting for " COLDBOOT_DONE;
-        panic();
-    }
-
-    property_set("ro.boottime.init.cold_boot_wait", std::to_string(t.duration_ms()).c_str());
-    return 0;
-}
-
-/*
- * Writes 512 bytes of output from Hardware RNG (/dev/hw_random, backed
- * by Linux kernel's hw_random framework) into Linux RNG's via /dev/urandom.
- * Does nothing if Hardware RNG is not present.
- *
- * Since we don't yet trust the quality of Hardware RNG, these bytes are not
- * mixed into the primary pool of Linux RNG and the entropy estimate is left
- * unmodified.
- *
- * If the HW RNG device /dev/hw_random is present, we require that at least
- * 512 bytes read from it are written into Linux RNG. QA is expected to catch
- * devices/configurations where these I/O operations are blocking for a long
- * time. We do not reboot or halt on failures, as this is a best-effort
- * attempt.
- */
-static int mix_hwrng_into_linux_rng_action(const std::vector<std::string>& args)
-{
-    int result = -1;
-    int hwrandom_fd = -1;
-    int urandom_fd = -1;
-    char buf[512];
-    ssize_t chunk_size;
-    size_t total_bytes_written = 0;
-
-    hwrandom_fd = TEMP_FAILURE_RETRY(
-            open("/dev/hw_random", O_RDONLY | O_NOFOLLOW | O_CLOEXEC));
-    if (hwrandom_fd == -1) {
-        if (errno == ENOENT) {
-            LOG(ERROR) << "/dev/hw_random not found";
-            // It's not an error to not have a Hardware RNG.
-            result = 0;
+        auto restart_time = s->time_started() + s->restart_period();
+        if (boot_clock::now() > restart_time) {
+            if (auto result = s->Start(); !result.ok()) {
+                LOG(ERROR) << "Could not restart process '" << s->name() << "': " << result.error();
+            }
         } else {
-            PLOG(ERROR) << "Failed to open /dev/hw_random";
+            if (!next_process_action_time || restart_time < *next_process_action_time) {
+                next_process_action_time = restart_time;
+            }
         }
-        goto ret;
     }
-
-    urandom_fd = TEMP_FAILURE_RETRY(
-            open("/dev/urandom", O_WRONLY | O_NOFOLLOW | O_CLOEXEC));
-    if (urandom_fd == -1) {
-        PLOG(ERROR) << "Failed to open /dev/urandom";
-        goto ret;
-    }
-
-    while (total_bytes_written < sizeof(buf)) {
-        chunk_size = TEMP_FAILURE_RETRY(
-                read(hwrandom_fd, buf, sizeof(buf) - total_bytes_written));
-        if (chunk_size == -1) {
-            PLOG(ERROR) << "Failed to read from /dev/hw_random";
-            goto ret;
-        } else if (chunk_size == 0) {
-            LOG(ERROR) << "Failed to read from /dev/hw_random: EOF";
-            goto ret;
-        }
-
-        chunk_size = TEMP_FAILURE_RETRY(write(urandom_fd, buf, chunk_size));
-        if (chunk_size == -1) {
-            PLOG(ERROR) << "Failed to write to /dev/urandom";
-            goto ret;
-        }
-        total_bytes_written += chunk_size;
-    }
-
-    LOG(INFO) << "Mixed " << total_bytes_written << " bytes from /dev/hw_random into /dev/urandom";
-    result = 0;
-
-ret:
-    if (hwrandom_fd != -1) {
-        close(hwrandom_fd);
-    }
-    if (urandom_fd != -1) {
-        close(urandom_fd);
-    }
-    return result;
+    return next_process_action_time;
 }
 
-static void security_failure() {
-    LOG(ERROR) << "Security failure...";
-    panic();
+static Result<void> DoControlStart(Service* service) {
+    return service->Start();
 }
 
-static bool set_highest_available_option_value(std::string path, int min, int max)
-{
-    std::ifstream inf(path, std::fstream::in);
-    if (!inf) {
-        LOG(ERROR) << "Cannot open for reading: " << path;
+static Result<void> DoControlStop(Service* service) {
+    service->Stop();
+    return {};
+}
+
+static Result<void> DoControlRestart(Service* service) {
+    service->Restart();
+    return {};
+}
+
+enum class ControlTarget {
+    SERVICE,    // function gets called for the named service
+    INTERFACE,  // action gets called for every service that holds this interface
+};
+
+using ControlMessageFunction = std::function<Result<void>(Service*)>;
+
+static const std::map<std::string, ControlMessageFunction, std::less<>>& GetControlMessageMap() {
+    // clang-format off
+    static const std::map<std::string, ControlMessageFunction, std::less<>> control_message_functions = {
+        {"sigstop_on",        [](auto* service) { service->set_sigstop(true); return Result<void>{}; }},
+        {"sigstop_off",       [](auto* service) { service->set_sigstop(false); return Result<void>{}; }},
+        {"oneshot_on",        [](auto* service) { service->set_oneshot(true); return Result<void>{}; }},
+        {"oneshot_off",       [](auto* service) { service->set_oneshot(false); return Result<void>{}; }},
+        {"start",             DoControlStart},
+        {"stop",              DoControlStop},
+        {"restart",           DoControlRestart},
+    };
+    // clang-format on
+
+    return control_message_functions;
+}
+
+static bool HandleControlMessage(std::string_view message, const std::string& name,
+                                 pid_t from_pid) {
+    std::string cmdline_path = StringPrintf("proc/%d/cmdline", from_pid);
+    std::string process_cmdline;
+    if (ReadFileToString(cmdline_path, &process_cmdline)) {
+        std::replace(process_cmdline.begin(), process_cmdline.end(), '\0', ' ');
+        process_cmdline = Trim(process_cmdline);
+    } else {
+        process_cmdline = "unknown process";
+    }
+
+    Service* service = nullptr;
+    auto action = message;
+    if (ConsumePrefix(&action, "interface_")) {
+        service = ServiceList::GetInstance().FindInterface(name);
+    } else {
+        service = ServiceList::GetInstance().FindService(name);
+    }
+
+    if (service == nullptr) {
+        LOG(ERROR) << "Control message: Could not find '" << name << "' for ctl." << message
+                   << " from pid: " << from_pid << " (" << process_cmdline << ")";
         return false;
     }
 
-    int current = max;
-    while (current >= min) {
-        // try to write out new value
-        std::string str_val = std::to_string(current);
-        std::ofstream of(path, std::fstream::out);
-        if (!of) {
-            LOG(ERROR) << "Cannot open for writing: " << path;
-            return false;
-        }
-        of << str_val << std::endl;
-        of.close();
-
-        // check to make sure it was recorded
-        inf.seekg(0);
-        std::string str_rec;
-        inf >> str_rec;
-        if (str_val.compare(str_rec) == 0) {
-            break;
-        }
-        current--;
-    }
-    inf.close();
-
-    if (current < min) {
-        LOG(ERROR) << "Unable to set minimum option value " << min << " in " << path;
+    const auto& map = GetControlMessageMap();
+    const auto it = map.find(action);
+    if (it == map.end()) {
+        LOG(ERROR) << "Unknown control msg '" << message << "'";
         return false;
     }
+    const auto& function = it->second;
+
+    if (auto result = function(service); !result.ok()) {
+        LOG(ERROR) << "Control message: Could not ctl." << message << " for '" << name
+                   << "' from pid: " << from_pid << " (" << process_cmdline
+                   << "): " << result.error();
+        return false;
+    }
+
+    LOG(INFO) << "Control message: Processed ctl." << message << " for '" << name
+              << "' from pid: " << from_pid << " (" << process_cmdline << ")";
     return true;
 }
 
-#define MMAP_RND_PATH "/proc/sys/vm/mmap_rnd_bits"
-#define MMAP_RND_COMPAT_PATH "/proc/sys/vm/mmap_rnd_compat_bits"
-
-/* __attribute__((unused)) due to lack of mips support: see mips block
- * in set_mmap_rnd_bits_action */
-static bool __attribute__((unused)) set_mmap_rnd_bits_min(int start, int min, bool compat) {
-    std::string path;
-    if (compat) {
-        path = MMAP_RND_COMPAT_PATH;
-    } else {
-        path = MMAP_RND_PATH;
+bool QueueControlMessage(const std::string& message, const std::string& name, pid_t pid, int fd) {
+    auto lock = std::lock_guard{pending_control_messages_lock};
+    if (pending_control_messages.size() > 100) {
+        LOG(ERROR) << "Too many pending control messages, dropped '" << message << "' for '" << name
+                   << "' from pid: " << pid;
+        return false;
     }
-
-    return set_highest_available_option_value(path, min, start);
+    pending_control_messages.push({message, name, pid, fd});
+    WakeMainInitThread();
+    return true;
 }
 
-/*
- * Set /proc/sys/vm/mmap_rnd_bits and potentially
- * /proc/sys/vm/mmap_rnd_compat_bits to the maximum supported values.
- * Returns -1 if unable to set these to an acceptable value.
- *
- * To support this sysctl, the following upstream commits are needed:
- *
- * d07e22597d1d mm: mmap: add new /proc tunable for mmap_base ASLR
- * e0c25d958f78 arm: mm: support ARCH_MMAP_RND_BITS
- * 8f0d3aa9de57 arm64: mm: support ARCH_MMAP_RND_BITS
- * 9e08f57d684a x86: mm: support ARCH_MMAP_RND_BITS
- * ec9ee4acd97c drivers: char: random: add get_random_long()
- * 5ef11c35ce86 mm: ASLR: use get_random_long()
- */
-static int set_mmap_rnd_bits_action(const std::vector<std::string>& args)
-{
-    int ret = -1;
+static void HandleControlMessages() {
+    auto lock = std::unique_lock{pending_control_messages_lock};
+    // Init historically would only execute handle one property message, including control messages
+    // in each iteration of its main loop.  We retain this behavior here to prevent starvation of
+    // other actions in the main loop.
+    if (!pending_control_messages.empty()) {
+        auto control_message = pending_control_messages.front();
+        pending_control_messages.pop();
+        lock.unlock();
 
-    /* values are arch-dependent */
-#if defined(__aarch64__)
-    /* arm64 supports 18 - 33 bits depending on pagesize and VA_SIZE */
-    if (set_mmap_rnd_bits_min(33, 24, false)
-            && set_mmap_rnd_bits_min(16, 16, true)) {
-        ret = 0;
-    }
-#elif defined(__x86_64__)
-    /* x86_64 supports 28 - 32 bits */
-    if (set_mmap_rnd_bits_min(32, 32, false)
-            && set_mmap_rnd_bits_min(16, 16, true)) {
-        ret = 0;
-    }
-#elif defined(__arm__) || defined(__i386__)
-    /* check to see if we're running on 64-bit kernel */
-    bool h64 = !access(MMAP_RND_COMPAT_PATH, F_OK);
-    /* supported 32-bit architecture must have 16 bits set */
-    if (set_mmap_rnd_bits_min(16, 16, h64)) {
-        ret = 0;
-    }
-#elif defined(__mips__) || defined(__mips64__)
-    // TODO: add mips support b/27788820
-    ret = 0;
-#else
-    LOG(ERROR) << "Unknown architecture";
-#endif
+        bool success = HandleControlMessage(control_message.message, control_message.name,
+                                            control_message.pid);
 
-    if (ret == -1) {
-        LOG(ERROR) << "Unable to set adequate mmap entropy value!";
-        security_failure();
+        uint32_t response = success ? PROP_SUCCESS : PROP_ERROR_HANDLE_CONTROL_MESSAGE;
+        if (control_message.fd != -1) {
+            TEMP_FAILURE_RETRY(send(control_message.fd, &response, sizeof(response), 0));
+            close(control_message.fd);
+        }
+        lock.lock();
     }
-    return ret;
+    // If we still have items to process, make sure we wake back up to do so.
+    if (!pending_control_messages.empty()) {
+        WakeMainInitThread();
+    }
 }
 
-#define KPTR_RESTRICT_PATH "/proc/sys/kernel/kptr_restrict"
-#define KPTR_RESTRICT_MINVALUE 2
-#define KPTR_RESTRICT_MAXVALUE 4
-
-/* Set kptr_restrict to the highest available level.
- *
- * Aborts if unable to set this to an acceptable value.
- */
-static int set_kptr_restrict_action(const std::vector<std::string>& args)
-{
-    std::string path = KPTR_RESTRICT_PATH;
-
-    if (!set_highest_available_option_value(path, KPTR_RESTRICT_MINVALUE, KPTR_RESTRICT_MAXVALUE)) {
-        LOG(ERROR) << "Unable to set adequate kptr_restrict value!";
-        security_failure();
+static Result<void> wait_for_coldboot_done_action(const BuiltinArguments& args) {
+    if (!prop_waiter_state.StartWaiting(kColdBootDoneProp, "true")) {
+        LOG(FATAL) << "Could not wait for '" << kColdBootDoneProp << "'";
     }
-    return 0;
+
+    return {};
 }
 
-static int keychord_init_action(const std::vector<std::string>& args)
-{
-    keychord_init();
-    return 0;
-}
-
-static int console_init_action(const std::vector<std::string>& args)
-{
-    std::string console = GetProperty("ro.boot.console", "");
-    if (!console.empty()) {
-        default_console = "/dev/" + console;
-    }
-    return 0;
-}
-
-static void import_kernel_nv(const std::string& key, const std::string& value, bool for_emulator) {
-    if (key.empty()) return;
-
-    if (for_emulator) {
-        // In the emulator, export any kernel option with the "ro.kernel." prefix.
-        property_set(StringPrintf("ro.kernel.%s", key.c_str()).c_str(), value.c_str());
-        return;
+static Result<void> SetupCgroupsAction(const BuiltinArguments&) {
+    // Have to create <CGROUPS_RC_DIR> using make_dir function
+    // for appropriate sepolicy to be set for it
+    make_dir(android::base::Dirname(CGROUPS_RC_PATH), 0711);
+    if (!CgroupSetup()) {
+        return ErrnoError() << "Failed to setup cgroups";
     }
 
-    if (key == "qemu") {
-        strlcpy(qemu, value.c_str(), sizeof(qemu));
-    } else if (android::base::StartsWith(key, "androidboot.")) {
-        property_set(StringPrintf("ro.boot.%s", key.c_str() + 12).c_str(), value.c_str());
-    }
+    return {};
 }
 
 static void export_oem_lock_status() {
     if (!android::base::GetBoolProperty("ro.oem_unlock_supported", false)) {
         return;
     }
-
-    std::string value = GetProperty("ro.boot.verifiedbootstate", "");
-
-    if (!value.empty()) {
-        property_set("ro.boot.flash.locked", value == "orange" ? "0" : "1");
-    }
+    SetProperty(
+            "ro.boot.flash.locked",
+            android::base::GetProperty("ro.boot.verifiedbootstate", "") == "orange" ? "0" : "1");
 }
 
-static void export_kernel_boot_props() {
-    struct {
-        const char *src_prop;
-        const char *dst_prop;
-        const char *default_value;
-    } prop_map[] = {
-        { "ro.boot.serialno",   "ro.serialno",   "", },
-        { "ro.boot.mode",       "ro.bootmode",   "unknown", },
-        { "ro.boot.baseband",   "ro.baseband",   "unknown", },
-        { "ro.boot.bootloader", "ro.bootloader", "unknown", },
-        { "ro.boot.hardware",   "ro.hardware",   "unknown", },
-        { "ro.boot.revision",   "ro.revision",   "0", },
-    };
-    for (size_t i = 0; i < arraysize(prop_map); i++) {
-        std::string value = GetProperty(prop_map[i].src_prop, "");
-        property_set(prop_map[i].dst_prop, (!value.empty()) ? value.c_str() : prop_map[i].default_value);
-    }
-}
-
-static void process_kernel_dt() {
-    if (!is_android_dt_value_expected("compatible", "android,firmware")) {
-        return;
-    }
-
-    std::unique_ptr<DIR, int (*)(DIR*)> dir(opendir(kAndroidDtDir.c_str()), closedir);
-    if (!dir) return;
-
-    std::string dt_file;
-    struct dirent *dp;
-    while ((dp = readdir(dir.get())) != NULL) {
-        if (dp->d_type != DT_REG || !strcmp(dp->d_name, "compatible") || !strcmp(dp->d_name, "name")) {
-            continue;
-        }
-
-        std::string file_name = kAndroidDtDir + dp->d_name;
-
-        android::base::ReadFileToString(file_name, &dt_file);
-        std::replace(dt_file.begin(), dt_file.end(), ',', '.');
-
-        std::string property_name = StringPrintf("ro.boot.%s", dp->d_name);
-        property_set(property_name.c_str(), dt_file.c_str());
-    }
-}
-
-static void process_kernel_cmdline() {
-    // The first pass does the common stuff, and finds if we are in qemu.
-    // The second pass is only necessary for qemu to export all kernel params
-    // as properties.
-    import_kernel_cmdline(false, import_kernel_nv);
-    if (qemu[0]) import_kernel_cmdline(true, import_kernel_nv);
-}
-
-static int property_enable_triggers_action(const std::vector<std::string>& args)
-{
+static Result<void> property_enable_triggers_action(const BuiltinArguments& args) {
     /* Enable property triggers. */
     property_triggers_enabled = 1;
-    return 0;
+    return {};
 }
 
-static int queue_property_triggers_action(const std::vector<std::string>& args)
-{
+static Result<void> queue_property_triggers_action(const BuiltinArguments& args) {
     ActionManager::GetInstance().QueueBuiltinAction(property_enable_triggers_action, "enable_property_trigger");
     ActionManager::GetInstance().QueueAllPropertyActions();
-    return 0;
-}
-
-static void selinux_init_all_handles(void)
-{
-    sehandle = selinux_android_file_context_handle();
-    selinux_android_set_sehandle(sehandle);
-    sehandle_prop = selinux_android_prop_context_handle();
-}
-
-enum selinux_enforcing_status { SELINUX_PERMISSIVE, SELINUX_ENFORCING };
-
-static selinux_enforcing_status selinux_status_from_cmdline() {
-    selinux_enforcing_status status = SELINUX_ENFORCING;
-
-    import_kernel_cmdline(false, [&](const std::string& key, const std::string& value, bool in_qemu) {
-        if (key == "androidboot.selinux" && value == "permissive") {
-            status = SELINUX_PERMISSIVE;
-        }
-    });
-
-    return status;
-}
-
-static bool selinux_is_enforcing(void)
-{
-    if (ALLOW_PERMISSIVE_SELINUX) {
-        return selinux_status_from_cmdline() == SELINUX_ENFORCING;
-    }
-    return true;
-}
-
-static int audit_callback(void *data, security_class_t /*cls*/, char *buf, size_t len) {
-
-    property_audit_data *d = reinterpret_cast<property_audit_data*>(data);
-
-    if (!d || !d->name || !d->cr) {
-        LOG(ERROR) << "audit_callback invoked with null data arguments!";
-        return 0;
-    }
-
-    snprintf(buf, len, "property=%s pid=%d uid=%d gid=%d", d->name,
-            d->cr->pid, d->cr->uid, d->cr->gid);
-    return 0;
-}
-
-/*
- * Forks, executes the provided program in the child, and waits for the completion in the parent.
- * Child's stderr is captured and logged using LOG(ERROR).
- *
- * Returns true if the child exited with status code 0, returns false otherwise.
- */
-static bool fork_execve_and_wait_for_completion(const char* filename, char* const argv[],
-                                                char* const envp[]) {
-    // Create a pipe used for redirecting child process's output.
-    // * pipe_fds[0] is the FD the parent will use for reading.
-    // * pipe_fds[1] is the FD the child will use for writing.
-    int pipe_fds[2];
-    if (pipe(pipe_fds) == -1) {
-        PLOG(ERROR) << "Failed to create pipe";
-        return false;
-    }
-
-    pid_t child_pid = fork();
-    if (child_pid == -1) {
-        PLOG(ERROR) << "Failed to fork for " << filename;
-        return false;
-    }
-
-    if (child_pid == 0) {
-        // fork succeeded -- this is executing in the child process
-
-        // Close the pipe FD not used by this process
-        TEMP_FAILURE_RETRY(close(pipe_fds[0]));
-
-        // Redirect stderr to the pipe FD provided by the parent
-        if (TEMP_FAILURE_RETRY(dup2(pipe_fds[1], STDERR_FILENO)) == -1) {
-            PLOG(ERROR) << "Failed to redirect stderr of " << filename;
-            _exit(127);
-            return false;
-        }
-        TEMP_FAILURE_RETRY(close(pipe_fds[1]));
-
-        if (execve(filename, argv, envp) == -1) {
-            PLOG(ERROR) << "Failed to execve " << filename;
-            return false;
-        }
-        // Unreachable because execve will have succeeded and replaced this code
-        // with child process's code.
-        _exit(127);
-        return false;
-    } else {
-        // fork succeeded -- this is executing in the original/parent process
-
-        // Close the pipe FD not used by this process
-        TEMP_FAILURE_RETRY(close(pipe_fds[1]));
-
-        // Log the redirected output of the child process.
-        // It's unfortunate that there's no standard way to obtain an istream for a file descriptor.
-        // As a result, we're buffering all output and logging it in one go at the end of the
-        // invocation, instead of logging it as it comes in.
-        const int child_out_fd = pipe_fds[0];
-        std::string child_output;
-        if (!android::base::ReadFdToString(child_out_fd, &child_output)) {
-            PLOG(ERROR) << "Failed to capture full output of " << filename;
-        }
-        TEMP_FAILURE_RETRY(close(child_out_fd));
-        if (!child_output.empty()) {
-            // Log captured output, line by line, because LOG expects to be invoked for each line
-            std::istringstream in(child_output);
-            std::string line;
-            while (std::getline(in, line)) {
-                LOG(ERROR) << filename << ": " << line;
-            }
-        }
-
-        // Wait for child to terminate
-        int status;
-        if (TEMP_FAILURE_RETRY(waitpid(child_pid, &status, 0)) != child_pid) {
-            PLOG(ERROR) << "Failed to wait for " << filename;
-            return false;
-        }
-
-        if (WIFEXITED(status)) {
-            int status_code = WEXITSTATUS(status);
-            if (status_code == 0) {
-                return true;
-            } else {
-                LOG(ERROR) << filename << " exited with status " << status_code;
-            }
-        } else if (WIFSIGNALED(status)) {
-            LOG(ERROR) << filename << " killed by signal " << WTERMSIG(status);
-        } else if (WIFSTOPPED(status)) {
-            LOG(ERROR) << filename << " stopped by signal " << WSTOPSIG(status);
-        } else {
-            LOG(ERROR) << "waitpid for " << filename << " returned unexpected status: " << status;
-        }
-
-        return false;
-    }
-}
-
-static bool read_first_line(const char* file, std::string* line) {
-    line->clear();
-
-    std::string contents;
-    if (!android::base::ReadFileToString(file, &contents, true /* follow symlinks */)) {
-        return false;
-    }
-    std::istringstream in(contents);
-    std::getline(in, *line);
-    return true;
-}
-
-static bool selinux_find_precompiled_split_policy(std::string* file) {
-    file->clear();
-
-    static constexpr const char precompiled_sepolicy[] = "/vendor/etc/selinux/precompiled_sepolicy";
-    if (access(precompiled_sepolicy, R_OK) == -1) {
-        return false;
-    }
-    std::string actual_plat_id;
-    if (!read_first_line("/system/etc/selinux/plat_and_mapping_sepolicy.cil.sha256",
-                         &actual_plat_id)) {
-        PLOG(INFO) << "Failed to read "
-                      "/system/etc/selinux/plat_and_mapping_sepolicy.cil.sha256";
-        return false;
-    }
-    std::string precompiled_plat_id;
-    if (!read_first_line("/vendor/etc/selinux/precompiled_sepolicy.plat_and_mapping.sha256",
-                         &precompiled_plat_id)) {
-        PLOG(INFO) << "Failed to read "
-                      "/vendor/etc/selinux/"
-                      "precompiled_sepolicy.plat_and_mapping.sha256";
-        return false;
-    }
-    if ((actual_plat_id.empty()) || (actual_plat_id != precompiled_plat_id)) {
-        return false;
-    }
-
-    *file = precompiled_sepolicy;
-    return true;
-}
-
-static bool selinux_get_vendor_mapping_version(std::string* plat_vers) {
-    if (!read_first_line("/vendor/etc/selinux/plat_sepolicy_vers.txt", plat_vers)) {
-        PLOG(ERROR) << "Failed to read /vendor/etc/selinux/plat_sepolicy_vers.txt";
-        return false;
-    }
-    if (plat_vers->empty()) {
-        LOG(ERROR) << "No version present in plat_sepolicy_vers.txt";
-        return false;
-    }
-    return true;
-}
-
-static constexpr const char plat_policy_cil_file[] = "/system/etc/selinux/plat_sepolicy.cil";
-
-static bool selinux_is_split_policy_device() { return access(plat_policy_cil_file, R_OK) != -1; }
-
-/*
- * Loads SELinux policy split across platform/system and non-platform/vendor files.
- *
- * Returns true upon success, false otherwise (failure cause is logged).
- */
-static bool selinux_load_split_policy() {
-    // IMPLEMENTATION NOTE: Split policy consists of three CIL files:
-    // * platform -- policy needed due to logic contained in the system image,
-    // * non-platform -- policy needed due to logic contained in the vendor image,
-    // * mapping -- mapping policy which helps preserve forward-compatibility of non-platform policy
-    //   with newer versions of platform policy.
-    //
-    // secilc is invoked to compile the above three policy files into a single monolithic policy
-    // file. This file is then loaded into the kernel.
-
-    // Load precompiled policy from vendor image, if a matching policy is found there. The policy
-    // must match the platform policy on the system image.
-    std::string precompiled_sepolicy_file;
-    if (selinux_find_precompiled_split_policy(&precompiled_sepolicy_file)) {
-        android::base::unique_fd fd(
-            open(precompiled_sepolicy_file.c_str(), O_RDONLY | O_CLOEXEC | O_BINARY));
-        if (fd != -1) {
-            if (selinux_android_load_policy_from_fd(fd, precompiled_sepolicy_file.c_str()) < 0) {
-                LOG(ERROR) << "Failed to load SELinux policy from " << precompiled_sepolicy_file;
-                return false;
-            }
-            return true;
-        }
-    }
-    // No suitable precompiled policy could be loaded
-
-    LOG(INFO) << "Compiling SELinux policy";
-
-    // Determine the highest policy language version supported by the kernel
-    set_selinuxmnt("/sys/fs/selinux");
-    int max_policy_version = security_policyvers();
-    if (max_policy_version == -1) {
-        PLOG(ERROR) << "Failed to determine highest policy version supported by kernel";
-        return false;
-    }
-
-    // We store the output of the compilation on /dev because this is the most convenient tmpfs
-    // storage mount available this early in the boot sequence.
-    char compiled_sepolicy[] = "/dev/sepolicy.XXXXXX";
-    android::base::unique_fd compiled_sepolicy_fd(mkostemp(compiled_sepolicy, O_CLOEXEC));
-    if (compiled_sepolicy_fd < 0) {
-        PLOG(ERROR) << "Failed to create temporary file " << compiled_sepolicy;
-        return false;
-    }
-
-    // Determine which mapping file to include
-    std::string vend_plat_vers;
-    if (!selinux_get_vendor_mapping_version(&vend_plat_vers)) {
-        return false;
-    }
-    std::string mapping_file("/system/etc/selinux/mapping/" + vend_plat_vers + ".cil");
-    // clang-format off
-    const char* compile_args[] = {
-        "/system/bin/secilc",
-        plat_policy_cil_file,
-        "-M", "true", "-G", "-N",
-        // Target the highest policy language version supported by the kernel
-        "-c", std::to_string(max_policy_version).c_str(),
-        mapping_file.c_str(),
-        "/vendor/etc/selinux/nonplat_sepolicy.cil",
-        "-o", compiled_sepolicy,
-        // We don't care about file_contexts output by the compiler
-        "-f", "/sys/fs/selinux/null",  // /dev/null is not yet available
-        nullptr};
-    // clang-format on
-
-    if (!fork_execve_and_wait_for_completion(compile_args[0], (char**)compile_args, (char**)ENV)) {
-        unlink(compiled_sepolicy);
-        return false;
-    }
-    unlink(compiled_sepolicy);
-
-    LOG(INFO) << "Loading compiled SELinux policy";
-    if (selinux_android_load_policy_from_fd(compiled_sepolicy_fd, compiled_sepolicy) < 0) {
-        LOG(ERROR) << "Failed to load SELinux policy from " << compiled_sepolicy;
-        return false;
-    }
-
-    return true;
-}
-
-/*
- * Loads SELinux policy from a monolithic file.
- *
- * Returns true upon success, false otherwise (failure cause is logged).
- */
-static bool selinux_load_monolithic_policy() {
-    LOG(VERBOSE) << "Loading SELinux policy from monolithic file";
-    if (selinux_android_load_policy() < 0) {
-        PLOG(ERROR) << "Failed to load monolithic SELinux policy";
-        return false;
-    }
-    return true;
-}
-
-/*
- * Loads SELinux policy into the kernel.
- *
- * Returns true upon success, false otherwise (failure cause is logged).
- */
-static bool selinux_load_policy() {
-    return selinux_is_split_policy_device() ? selinux_load_split_policy()
-                                            : selinux_load_monolithic_policy();
-}
-
-static void selinux_initialize(bool in_kernel_domain) {
-    Timer t;
-
-    selinux_callback cb;
-    cb.func_log = selinux_klog_callback;
-    selinux_set_callback(SELINUX_CB_LOG, cb);
-    cb.func_audit = audit_callback;
-    selinux_set_callback(SELINUX_CB_AUDIT, cb);
-
-    if (in_kernel_domain) {
-        LOG(INFO) << "Loading SELinux policy";
-        if (!selinux_load_policy()) {
-            panic();
-        }
-
-        bool kernel_enforcing = (security_getenforce() == 1);
-        bool is_enforcing = selinux_is_enforcing();
-        if (kernel_enforcing != is_enforcing) {
-            if (security_setenforce(is_enforcing)) {
-                PLOG(ERROR) << "security_setenforce(%s) failed" << (is_enforcing ? "true" : "false");
-                security_failure();
-            }
-        }
-
-        std::string err;
-        if (!WriteFile("/sys/fs/selinux/checkreqprot", "0", &err)) {
-            LOG(ERROR) << err;
-            security_failure();
-        }
-
-        // init's first stage can't set properties, so pass the time to the second stage.
-        setenv("INIT_SELINUX_TOOK", std::to_string(t.duration_ms()).c_str(), 1);
-    } else {
-        selinux_init_all_handles();
-    }
-}
-
-// The files and directories that were created before initial sepolicy load or
-// files on ramdisk need to have their security context restored to the proper
-// value. This must happen before /dev is populated by ueventd.
-static void selinux_restore_context() {
-    LOG(INFO) << "Running restorecon...";
-    selinux_android_restorecon("/dev", 0);
-    selinux_android_restorecon("/dev/kmsg", 0);
-    if constexpr (WORLD_WRITABLE_KMSG) {
-        selinux_android_restorecon("/dev/kmsg_debug", 0);
-    }
-    selinux_android_restorecon("/dev/socket", 0);
-    selinux_android_restorecon("/dev/random", 0);
-    selinux_android_restorecon("/dev/urandom", 0);
-    selinux_android_restorecon("/dev/__properties__", 0);
-
-    selinux_android_restorecon("/file_contexts.bin", 0);
-    selinux_android_restorecon("/plat_file_contexts", 0);
-    selinux_android_restorecon("/nonplat_file_contexts", 0);
-    selinux_android_restorecon("/plat_property_contexts", 0);
-    selinux_android_restorecon("/nonplat_property_contexts", 0);
-    selinux_android_restorecon("/plat_seapp_contexts", 0);
-    selinux_android_restorecon("/nonplat_seapp_contexts", 0);
-    selinux_android_restorecon("/plat_service_contexts", 0);
-    selinux_android_restorecon("/nonplat_service_contexts", 0);
-    selinux_android_restorecon("/plat_hwservice_contexts", 0);
-    selinux_android_restorecon("/nonplat_hwservice_contexts", 0);
-    selinux_android_restorecon("/sepolicy", 0);
-    selinux_android_restorecon("/vndservice_contexts", 0);
-
-    selinux_android_restorecon("/sys", SELINUX_ANDROID_RESTORECON_RECURSE);
-    selinux_android_restorecon("/dev/block", SELINUX_ANDROID_RESTORECON_RECURSE);
-    selinux_android_restorecon("/dev/device-mapper", 0);
-
-    selinux_android_restorecon("/sbin/mke2fs", 0);
-    selinux_android_restorecon("/sbin/e2fsdroid", 0);
+    return {};
 }
 
 // Set the UDC controller for the ConfigFS USB Gadgets.
 // Read the UDC controller in use from "/sys/class/udc".
 // In case of multiple UDC controllers select the first one.
-static void set_usb_controller() {
+static void SetUsbController() {
+    static auto controller_set = false;
+    if (controller_set) return;
     std::unique_ptr<DIR, decltype(&closedir)>dir(opendir("/sys/class/udc"), closedir);
     if (!dir) return;
 
@@ -930,125 +552,315 @@ static void set_usb_controller() {
     while ((dp = readdir(dir.get())) != nullptr) {
         if (dp->d_name[0] == '.') continue;
 
-        property_set("sys.usb.controller", dp->d_name);
+        SetProperty("sys.usb.controller", dp->d_name);
+        controller_set = true;
         break;
     }
 }
 
-static void install_reboot_signal_handlers() {
-    // Instead of panic'ing the kernel as is the default behavior when init crashes,
-    // we prefer to reboot to bootloader on development builds, as this will prevent
-    // boot looping bad configurations and allow both developers and test farms to easily
-    // recover.
-    struct sigaction action;
-    memset(&action, 0, sizeof(action));
-    sigfillset(&action.sa_mask);
-    action.sa_handler = [](int) {
-        // panic() reboots to bootloader
-        panic();
-    };
-    action.sa_flags = SA_RESTART;
-    sigaction(SIGABRT, &action, nullptr);
-    sigaction(SIGBUS, &action, nullptr);
-    sigaction(SIGFPE, &action, nullptr);
-    sigaction(SIGILL, &action, nullptr);
-    sigaction(SIGSEGV, &action, nullptr);
-#if defined(SIGSTKFLT)
-    sigaction(SIGSTKFLT, &action, nullptr);
-#endif
-    sigaction(SIGSYS, &action, nullptr);
-    sigaction(SIGTRAP, &action, nullptr);
+/// Set ro.kernel.version property to contain the major.minor pair as returned
+/// by uname(2).
+static void SetKernelVersion() {
+    struct utsname uts;
+    unsigned int major, minor;
+
+    if ((uname(&uts) != 0) || (sscanf(uts.release, "%u.%u", &major, &minor) != 2)) {
+        LOG(ERROR) << "Could not parse the kernel version from uname";
+        return;
+    }
+    SetProperty("ro.kernel.version", android::base::StringPrintf("%u.%u", major, minor));
 }
 
-int main(int argc, char** argv) {
-    if (!strcmp(basename(argv[0]), "ueventd")) {
-        return ueventd_main(argc, argv);
+static void HandleSigtermSignal(const signalfd_siginfo& siginfo) {
+    if (siginfo.ssi_pid != 0) {
+        // Drop any userspace SIGTERM requests.
+        LOG(DEBUG) << "Ignoring SIGTERM from pid " << siginfo.ssi_pid;
+        return;
     }
 
-    if (!strcmp(basename(argv[0]), "watchdogd")) {
-        return watchdogd_main(argc, argv);
+    HandlePowerctlMessage("shutdown,container");
+}
+
+static constexpr std::chrono::milliseconds kDiagnosticTimeout = 10s;
+
+static void HandleSignalFd(bool one_off) {
+    signalfd_siginfo siginfo;
+    auto started = std::chrono::steady_clock::now();
+    do {
+        ssize_t bytes_read = TEMP_FAILURE_RETRY(read(signal_fd, &siginfo, sizeof(siginfo)));
+        if (bytes_read < 0 && errno == EAGAIN) {
+            auto now = std::chrono::steady_clock::now();
+            std::chrono::duration<double> waited = now - started;
+            if (waited >= kDiagnosticTimeout) {
+                LOG(ERROR) << "epoll() woke us up, but we waited with no SIGCHLD!";
+                started = now;
+            }
+
+            std::this_thread::sleep_for(100ms);
+            continue;
+        }
+        if (bytes_read != sizeof(siginfo)) {
+            PLOG(ERROR) << "Failed to read siginfo from signal_fd";
+            return;
+        }
+        break;
+    } while (!one_off);
+
+    switch (siginfo.ssi_signo) {
+        case SIGCHLD:
+            ReapAnyOutstandingChildren();
+            break;
+        case SIGTERM:
+            HandleSigtermSignal(siginfo);
+            break;
+        default:
+            PLOG(ERROR) << "signal_fd: received unexpected signal " << siginfo.ssi_signo;
+            break;
+    }
+}
+
+static void UnblockSignals() {
+    const struct sigaction act { .sa_handler = SIG_DFL };
+    sigaction(SIGCHLD, &act, nullptr);
+
+    sigset_t mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGCHLD);
+    sigaddset(&mask, SIGTERM);
+
+    if (sigprocmask(SIG_UNBLOCK, &mask, nullptr) == -1) {
+        PLOG(FATAL) << "failed to unblock signals for PID " << getpid();
+    }
+}
+
+static void InstallSignalFdHandler(Epoll* epoll) {
+    // Applying SA_NOCLDSTOP to a defaulted SIGCHLD handler prevents the signalfd from receiving
+    // SIGCHLD when a child process stops or continues (b/77867680#comment9).
+    const struct sigaction act { .sa_handler = SIG_DFL, .sa_flags = SA_NOCLDSTOP };
+    sigaction(SIGCHLD, &act, nullptr);
+
+    sigset_t mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGCHLD);
+
+    if (!IsRebootCapable()) {
+        // If init does not have the CAP_SYS_BOOT capability, it is running in a container.
+        // In that case, receiving SIGTERM will cause the system to shut down.
+        sigaddset(&mask, SIGTERM);
     }
 
+    if (sigprocmask(SIG_BLOCK, &mask, nullptr) == -1) {
+        PLOG(FATAL) << "failed to block signals";
+    }
+
+    // Register a handler to unblock signals in the child processes.
+    const int result = pthread_atfork(nullptr, nullptr, &UnblockSignals);
+    if (result != 0) {
+        LOG(FATAL) << "Failed to register a fork handler: " << strerror(result);
+    }
+
+    signal_fd = signalfd(-1, &mask, SFD_CLOEXEC | SFD_NONBLOCK);
+    if (signal_fd == -1) {
+        PLOG(FATAL) << "failed to create signalfd";
+    }
+
+    constexpr int flags = EPOLLIN | EPOLLPRI;
+    auto handler = std::bind(HandleSignalFd, false);
+    if (auto result = epoll->RegisterHandler(signal_fd, handler, flags); !result.ok()) {
+        LOG(FATAL) << result.error();
+    }
+}
+
+void HandleKeychord(const std::vector<int>& keycodes) {
+    // Only handle keychords if adb is enabled.
+    std::string adb_enabled = android::base::GetProperty("init.svc.adbd", "");
+    if (adb_enabled != "running") {
+        LOG(WARNING) << "Not starting service for keychord " << android::base::Join(keycodes, ' ')
+                     << " because ADB is disabled";
+        return;
+    }
+
+    auto found = false;
+    for (const auto& service : ServiceList::GetInstance()) {
+        auto svc = service.get();
+        if (svc->keycodes() == keycodes) {
+            found = true;
+            LOG(INFO) << "Starting service '" << svc->name() << "' from keychord "
+                      << android::base::Join(keycodes, ' ');
+            if (auto result = svc->Start(); !result.ok()) {
+                LOG(ERROR) << "Could not start service '" << svc->name() << "' from keychord "
+                           << android::base::Join(keycodes, ' ') << ": " << result.error();
+            }
+        }
+    }
+    if (!found) {
+        LOG(ERROR) << "Service for keychord " << android::base::Join(keycodes, ' ') << " not found";
+    }
+}
+
+static void UmountDebugRamdisk() {
+    if (umount("/debug_ramdisk") != 0) {
+        PLOG(ERROR) << "Failed to umount /debug_ramdisk";
+    }
+}
+
+static void UmountSecondStageRes() {
+    if (umount(kSecondStageRes) != 0) {
+        PLOG(ERROR) << "Failed to umount " << kSecondStageRes;
+    }
+}
+
+static void MountExtraFilesystems() {
+#define CHECKCALL(x) \
+    if ((x) != 0) PLOG(FATAL) << #x " failed.";
+
+    // /apex is used to mount APEXes
+    CHECKCALL(mount("tmpfs", "/apex", "tmpfs", MS_NOEXEC | MS_NOSUID | MS_NODEV,
+                    "mode=0755,uid=0,gid=0"));
+
+    // /linkerconfig is used to keep generated linker configuration
+    CHECKCALL(mount("tmpfs", "/linkerconfig", "tmpfs", MS_NOEXEC | MS_NOSUID | MS_NODEV,
+                    "mode=0755,uid=0,gid=0"));
+#undef CHECKCALL
+}
+
+static void RecordStageBoottimes(const boot_clock::time_point& second_stage_start_time) {
+    int64_t first_stage_start_time_ns = -1;
+    if (auto first_stage_start_time_str = getenv(kEnvFirstStageStartedAt);
+        first_stage_start_time_str) {
+        SetProperty("ro.boottime.init", first_stage_start_time_str);
+        android::base::ParseInt(first_stage_start_time_str, &first_stage_start_time_ns);
+    }
+    unsetenv(kEnvFirstStageStartedAt);
+
+    int64_t selinux_start_time_ns = -1;
+    if (auto selinux_start_time_str = getenv(kEnvSelinuxStartedAt); selinux_start_time_str) {
+        android::base::ParseInt(selinux_start_time_str, &selinux_start_time_ns);
+    }
+    unsetenv(kEnvSelinuxStartedAt);
+
+    if (selinux_start_time_ns == -1) return;
+    if (first_stage_start_time_ns == -1) return;
+
+    SetProperty("ro.boottime.init.first_stage",
+                std::to_string(selinux_start_time_ns - first_stage_start_time_ns));
+    SetProperty("ro.boottime.init.selinux",
+                std::to_string(second_stage_start_time.time_since_epoch().count() -
+                               selinux_start_time_ns));
+    if (auto init_module_time_str = getenv(kEnvInitModuleDurationMs); init_module_time_str) {
+        SetProperty("ro.boottime.init.modules", init_module_time_str);
+        unsetenv(kEnvInitModuleDurationMs);
+    }
+}
+
+void SendLoadPersistentPropertiesMessage() {
+    auto init_message = InitMessage{};
+    init_message.set_load_persistent_properties(true);
+    if (auto result = SendMessage(property_fd, init_message); !result.ok()) {
+        LOG(ERROR) << "Failed to send load persistent properties message: " << result.error();
+    }
+}
+
+static Result<void> ConnectEarlyStageSnapuserdAction(const BuiltinArguments& args) {
+    auto pid = GetSnapuserdFirstStagePid();
+    if (!pid) {
+        return {};
+    }
+
+    auto info = GetSnapuserdFirstStageInfo();
+    if (auto iter = std::find(info.begin(), info.end(), "socket"s); iter == info.end()) {
+        // snapuserd does not support socket handoff, so exit early.
+        return {};
+    }
+
+    // Socket handoff is supported.
+    auto svc = ServiceList::GetInstance().FindService("snapuserd");
+    if (!svc) {
+        LOG(FATAL) << "Failed to find snapuserd service entry";
+    }
+
+    svc->SetShutdownCritical();
+    svc->SetStartedInFirstStage(*pid);
+
+    svc = ServiceList::GetInstance().FindService("snapuserd_proxy");
+    if (!svc) {
+        LOG(FATAL) << "Failed find snapuserd_proxy service entry, merge will never initiate";
+    }
+    if (!svc->MarkSocketPersistent("snapuserd")) {
+        LOG(FATAL) << "Could not find snapuserd socket in snapuserd_proxy service entry";
+    }
+    if (auto result = svc->Start(); !result.ok()) {
+        LOG(FATAL) << "Could not start snapuserd_proxy: " << result.error();
+    }
+    return {};
+}
+
+static void DumpPidFds(const std::string& prefix, pid_t pid) {
+    std::error_code ec;
+    std::string proc_dir = "/proc/" + std::to_string(pid) + "/fd";
+    for (const auto& entry : std::filesystem::directory_iterator(proc_dir)) {
+        std::string target;
+        if (android::base::Readlink(entry.path(), &target)) {
+            LOG(ERROR) << prefix << target;
+        } else {
+            LOG(ERROR) << prefix << entry.path();
+        }
+    }
+}
+
+static void DumpFile(const std::string& prefix, const std::string& file) {
+    std::ifstream fp(file);
+    if (!fp) {
+        LOG(ERROR) << "Could not open " << file;
+        return;
+    }
+
+    std::string line;
+    while (std::getline(fp, line)) {
+        LOG(ERROR) << prefix << line;
+    }
+}
+
+int SecondStageMain(int argc, char** argv) {
     if (REBOOT_BOOTLOADER_ON_PANIC) {
-        install_reboot_signal_handlers();
+        InstallRebootSignalHandlers();
     }
 
-    add_environment("PATH", _PATH_DEFPATH);
+    // No threads should be spin up until signalfd
+    // is registered. If the threads are indeed required,
+    // each of these threads _should_ make sure SIGCHLD signal
+    // is blocked. See b/223076262
+    boot_clock::time_point start_time = boot_clock::now();
 
-    bool is_first_stage = (getenv("INIT_SECOND_STAGE") == nullptr);
+    trigger_shutdown = [](const std::string& command) { shutdown_state.TriggerShutdown(command); };
 
-    if (is_first_stage) {
-        boot_clock::time_point start_time = boot_clock::now();
-
-        // Clear the umask.
-        umask(0);
-
-        // Get the basic filesystem setup we need put together in the initramdisk
-        // on / and then we'll let the rc file figure out the rest.
-        mount("tmpfs", "/dev", "tmpfs", MS_NOSUID, "mode=0755");
-        mkdir("/dev/pts", 0755);
-        mkdir("/dev/socket", 0755);
-        mount("devpts", "/dev/pts", "devpts", 0, NULL);
-        #define MAKE_STR(x) __STRING(x)
-        mount("proc", "/proc", "proc", 0, "hidepid=2,gid=" MAKE_STR(AID_READPROC));
-        // Don't expose the raw commandline to unprivileged processes.
-        chmod("/proc/cmdline", 0440);
-        gid_t groups[] = { AID_READPROC };
-        setgroups(arraysize(groups), groups);
-        mount("sysfs", "/sys", "sysfs", 0, NULL);
-        mount("selinuxfs", "/sys/fs/selinux", "selinuxfs", 0, NULL);
-
-        mknod("/dev/kmsg", S_IFCHR | 0600, makedev(1, 11));
-
-        if constexpr (WORLD_WRITABLE_KMSG) {
-          mknod("/dev/kmsg_debug", S_IFCHR | 0622, makedev(1, 11));
-        }
-
-        mknod("/dev/random", S_IFCHR | 0666, makedev(1, 8));
-        mknod("/dev/urandom", S_IFCHR | 0666, makedev(1, 9));
-
-        // Now that tmpfs is mounted on /dev and we have /dev/kmsg, we can actually
-        // talk to the outside world...
-        InitKernelLogging(argv);
-
-        LOG(INFO) << "init first stage started!";
-
-        if (!DoFirstStageMount()) {
-            LOG(ERROR) << "Failed to mount required partitions early ...";
-            panic();
-        }
-
-        SetInitAvbVersionInRecovery();
-
-        // Set up SELinux, loading the SELinux policy.
-        selinux_initialize(true);
-
-        // We're in the kernel domain, so re-exec init to transition to the init domain now
-        // that the SELinux policy has been loaded.
-        if (selinux_android_restorecon("/init", 0) == -1) {
-            PLOG(ERROR) << "restorecon failed";
-            security_failure();
-        }
-
-        setenv("INIT_SECOND_STAGE", "true", 1);
-
-        static constexpr uint32_t kNanosecondsPerMillisecond = 1e6;
-        uint64_t start_ms = start_time.time_since_epoch().count() / kNanosecondsPerMillisecond;
-        setenv("INIT_STARTED_AT", StringPrintf("%" PRIu64, start_ms).c_str(), 1);
-
-        char* path = argv[0];
-        char* args[] = { path, nullptr };
-        execv(path, args);
-
-        // execv() only returns if an error happened, in which case we
-        // panic and never fall through this conditional.
-        PLOG(ERROR) << "execv(\"" << path << "\") failed";
-        security_failure();
-    }
-
-    // At this point we're in the second stage of init.
+    SetStdioToDevNull(argv);
     InitKernelLogging(argv);
     LOG(INFO) << "init second stage started!";
+
+    // Update $PATH in the case the second stage init is newer than first stage init, where it is
+    // first set.
+    if (setenv("PATH", _PATH_DEFPATH, 1) != 0) {
+        PLOG(FATAL) << "Could not set $PATH to '" << _PATH_DEFPATH << "' in second stage";
+    }
+
+    // Init should not crash because of a dependence on any other process, therefore we ignore
+    // SIGPIPE and handle EPIPE at the call site directly.  Note that setting a signal to SIG_IGN
+    // is inherited across exec, but custom signal handlers are not.  Since we do not want to
+    // ignore SIGPIPE for child processes, we set a no-op function for the signal handler instead.
+    {
+        struct sigaction action = {.sa_flags = SA_RESTART};
+        action.sa_handler = [](int) {};
+        sigaction(SIGPIPE, &action, nullptr);
+    }
+
+    // Set init and its forked children's oom_adj.
+    if (auto result =
+                WriteFile("/proc/1/oom_score_adj", StringPrintf("%d", DEFAULT_OOM_SCORE_ADJUST));
+        !result.ok()) {
+        LOG(ERROR) << "Unable to write " << DEFAULT_OOM_SCORE_ADJUST
+                   << " to /proc/1/oom_score_adj: " << result.error();
+    }
 
     // Set up a session keyring that all processes will have access to. It
     // will hold things like FBE encryption keys. No process should override
@@ -1058,94 +870,109 @@ int main(int argc, char** argv) {
     // Indicate that booting is in progress to background fw loaders, etc.
     close(open("/dev/.booting", O_WRONLY | O_CREAT | O_CLOEXEC, 0000));
 
-    property_init();
+    // See if need to load debug props to allow adb root, when the device is unlocked.
+    const char* force_debuggable_env = getenv("INIT_FORCE_DEBUGGABLE");
+    bool load_debug_prop = false;
+    if (force_debuggable_env && AvbHandle::IsDeviceUnlocked()) {
+        load_debug_prop = "true"s == force_debuggable_env;
+    }
+    unsetenv("INIT_FORCE_DEBUGGABLE");
 
-    // If arguments are passed both on the command line and in DT,
-    // properties set in DT always have priority over the command-line ones.
-    process_kernel_dt();
-    process_kernel_cmdline();
+    // Umount the debug ramdisk so property service doesn't read .prop files from there, when it
+    // is not meant to.
+    if (!load_debug_prop) {
+        UmountDebugRamdisk();
+    }
 
-    // Propagate the kernel variables to internal variables
-    // used by init as well as the current required properties.
-    export_kernel_boot_props();
+    PropertyInit();
 
-    // Make the time that init started available for bootstat to log.
-    property_set("ro.boottime.init", getenv("INIT_STARTED_AT"));
-    property_set("ro.boottime.init.selinux", getenv("INIT_SELINUX_TOOK"));
+    // Umount second stage resources after property service has read the .prop files.
+    UmountSecondStageRes();
 
-    // Set libavb version for Framework-only OTA match in Treble build.
-    const char* avb_version = getenv("INIT_AVB_VERSION");
-    if (avb_version) property_set("ro.boot.avb_version", avb_version);
+    // Umount the debug ramdisk after property service has read the .prop files when it means to.
+    if (load_debug_prop) {
+        UmountDebugRamdisk();
+    }
 
-    // Clean up our environment.
-    unsetenv("INIT_SECOND_STAGE");
-    unsetenv("INIT_STARTED_AT");
-    unsetenv("INIT_SELINUX_TOOK");
-    unsetenv("INIT_AVB_VERSION");
+    // Mount extra filesystems required during second stage init
+    MountExtraFilesystems();
 
     // Now set up SELinux for second stage.
-    selinux_initialize(false);
-    selinux_restore_context();
+    SelinuxSetupKernelLogging();
+    SelabelInitialize();
+    SelinuxRestoreContext();
 
-    epoll_fd = epoll_create1(EPOLL_CLOEXEC);
-    if (epoll_fd == -1) {
-        PLOG(ERROR) << "epoll_create1 failed";
-        exit(1);
+    Epoll epoll;
+    if (auto result = epoll.Open(); !result.ok()) {
+        PLOG(FATAL) << result.error();
     }
 
-    signal_handler_init();
+    InstallSignalFdHandler(&epoll);
+    InstallInitNotifier(&epoll);
+    StartPropertyService(&property_fd);
 
-    property_load_boot_defaults();
+    // Make the time that init stages started available for bootstat to log.
+    RecordStageBoottimes(start_time);
+
+    // Set libavb version for Framework-only OTA match in Treble build.
+    if (const char* avb_version = getenv("INIT_AVB_VERSION"); avb_version != nullptr) {
+        SetProperty("ro.boot.avb_version", avb_version);
+    }
+    unsetenv("INIT_AVB_VERSION");
+
+    fs_mgr_vendor_overlay_mount_all();
     export_oem_lock_status();
-    start_property_service();
-    set_usb_controller();
+    MountHandler mount_handler(&epoll);
+    SetUsbController();
+    SetKernelVersion();
 
-    const BuiltinFunctionMap function_map;
+    const BuiltinFunctionMap& function_map = GetBuiltinFunctionMap();
     Action::set_function_map(&function_map);
 
-    ActionManager& am = ActionManager::GetInstance();
-    ServiceManager& sm = ServiceManager::GetInstance();
-    Parser& parser = Parser::GetInstance();
-
-    parser.AddSectionParser("service", std::make_unique<ServiceParser>(&sm));
-    parser.AddSectionParser("on", std::make_unique<ActionParser>(&am));
-    parser.AddSectionParser("import", std::make_unique<ImportParser>(&parser));
-    std::string bootscript = GetProperty("ro.boot.init_rc", "");
-    if (bootscript.empty()) {
-        parser.ParseConfig("/init.rc");
-        parser.set_is_system_etc_init_loaded(
-                parser.ParseConfig("/system/etc/init"));
-        parser.set_is_vendor_etc_init_loaded(
-                parser.ParseConfig("/vendor/etc/init"));
-        parser.set_is_odm_etc_init_loaded(parser.ParseConfig("/odm/etc/init"));
-    } else {
-        parser.ParseConfig(bootscript);
-        parser.set_is_system_etc_init_loaded(true);
-        parser.set_is_vendor_etc_init_loaded(true);
-        parser.set_is_odm_etc_init_loaded(true);
+    if (!SetupMountNamespaces()) {
+        PLOG(FATAL) << "SetupMountNamespaces failed";
     }
+
+    InitializeSubcontext();
+
+    ActionManager& am = ActionManager::GetInstance();
+    ServiceList& sm = ServiceList::GetInstance();
+
+    LoadBootScripts(am, sm);
 
     // Turning this on and letting the INFO logging be discarded adds 0.2s to
     // Nexus 9 boot time, so it's disabled by default.
     if (false) DumpState();
 
+    // Make the GSI status available before scripts start running.
+    auto is_running = android::gsi::IsGsiRunning() ? "1" : "0";
+    SetProperty(gsi::kGsiBootedProp, is_running);
+    auto is_installed = android::gsi::IsGsiInstalled() ? "1" : "0";
+    SetProperty(gsi::kGsiInstalledProp, is_installed);
+
+    am.QueueBuiltinAction(SetupCgroupsAction, "SetupCgroups");
+    am.QueueBuiltinAction(SetKptrRestrictAction, "SetKptrRestrict");
+    am.QueueBuiltinAction(TestPerfEventSelinuxAction, "TestPerfEventSelinux");
+    am.QueueBuiltinAction(ConnectEarlyStageSnapuserdAction, "ConnectEarlyStageSnapuserd");
     am.QueueEventTrigger("early-init");
 
     // Queue an action that waits for coldboot done so we know ueventd has set up all of /dev...
     am.QueueBuiltinAction(wait_for_coldboot_done_action, "wait_for_coldboot_done");
     // ... so that we can start queuing up actions that require stuff from /dev.
-    am.QueueBuiltinAction(mix_hwrng_into_linux_rng_action, "mix_hwrng_into_linux_rng");
-    am.QueueBuiltinAction(set_mmap_rnd_bits_action, "set_mmap_rnd_bits");
-    am.QueueBuiltinAction(set_kptr_restrict_action, "set_kptr_restrict");
-    am.QueueBuiltinAction(keychord_init_action, "keychord_init");
-    am.QueueBuiltinAction(console_init_action, "console_init");
+    am.QueueBuiltinAction(SetMmapRndBitsAction, "SetMmapRndBits");
+    Keychords keychords;
+    am.QueueBuiltinAction(
+            [&epoll, &keychords](const BuiltinArguments& args) -> Result<void> {
+                for (const auto& svc : ServiceList::GetInstance()) {
+                    keychords.Register(svc->keycodes());
+                }
+                keychords.Start(&epoll, HandleKeychord);
+                return {};
+            },
+            "KeychordInit");
 
     // Trigger all the boot actions to get us started.
     am.QueueEventTrigger("init");
-
-    // Repeat mix_hwrng_into_linux_rng in case /dev/hw_random or /dev/random
-    // wasn't ready immediately after wait_for_coldboot_done
-    am.QueueBuiltinAction(mix_hwrng_into_linux_rng_action, "mix_hwrng_into_linux_rng");
 
     // Don't mount filesystems or start core system services in charger mode.
     std::string bootmode = GetProperty("ro.bootmode", "");
@@ -1158,34 +985,78 @@ int main(int argc, char** argv) {
     // Run all property triggers based on current state of the properties.
     am.QueueBuiltinAction(queue_property_triggers_action, "queue_property_triggers");
 
+    // Restore prio before main loop
+    setpriority(PRIO_PROCESS, 0, 0);
     while (true) {
         // By default, sleep until something happens.
-        int epoll_timeout_ms = -1;
+        auto epoll_timeout = std::optional<std::chrono::milliseconds>{kDiagnosticTimeout};
 
-        if (!(waiting_for_prop || sm.IsWaitingForExec())) {
+        auto shutdown_command = shutdown_state.CheckShutdown();
+        if (shutdown_command) {
+            LOG(INFO) << "Got shutdown_command '" << *shutdown_command
+                      << "' Calling HandlePowerctlMessage()";
+            HandlePowerctlMessage(*shutdown_command);
+            shutdown_state.set_do_shutdown(false);
+        }
+
+        if (!(prop_waiter_state.MightBeWaiting() || Service::is_exec_service_running())) {
             am.ExecuteOneCommand();
         }
-        if (!(waiting_for_prop || sm.IsWaitingForExec())) {
-            restart_processes();
+        if (!IsShuttingDown()) {
+            auto next_process_action_time = HandleProcessActions();
 
             // If there's a process that needs restarting, wake up in time for that.
-            if (process_needs_restart_at != 0) {
-                epoll_timeout_ms = (process_needs_restart_at - time(nullptr)) * 1000;
-                if (epoll_timeout_ms < 0) epoll_timeout_ms = 0;
+            if (next_process_action_time) {
+                epoll_timeout = std::chrono::ceil<std::chrono::milliseconds>(
+                        *next_process_action_time - boot_clock::now());
+                if (*epoll_timeout < 0ms) epoll_timeout = 0ms;
             }
-
-            // If there's more work to do, wake up again immediately.
-            if (am.HasMoreCommands()) epoll_timeout_ms = 0;
         }
 
-        epoll_event ev;
-        int nr = TEMP_FAILURE_RETRY(epoll_wait(epoll_fd, &ev, 1, epoll_timeout_ms));
-        if (nr == -1) {
-            PLOG(ERROR) << "epoll_wait failed";
-        } else if (nr == 1) {
-            ((void (*)()) ev.data.ptr)();
+        if (!(prop_waiter_state.MightBeWaiting() || Service::is_exec_service_running())) {
+            // If there's more work to do, wake up again immediately.
+            if (am.HasMoreCommands()) epoll_timeout = 0ms;
+        }
+
+        auto pending_functions = epoll.Wait(epoll_timeout);
+        if (!pending_functions.ok()) {
+            LOG(ERROR) << pending_functions.error();
+        } else if (!pending_functions->empty()) {
+            // We always reap children before responding to the other pending functions. This is to
+            // prevent a race where other daemons see that a service has exited and ask init to
+            // start it again via ctl.start before init has reaped it.
+            ReapAnyOutstandingChildren();
+            for (const auto& function : *pending_functions) {
+                (*function)();
+            }
+        } else if (Service::is_exec_service_running()) {
+            static bool dumped_diagnostics = false;
+            std::chrono::duration<double> waited =
+                    std::chrono::steady_clock::now() - Service::exec_service_started();
+            if (waited >= kDiagnosticTimeout) {
+                LOG(ERROR) << "Exec service is hung? Waited " << waited.count()
+                           << " without SIGCHLD";
+                if (!dumped_diagnostics) {
+                    DumpPidFds("exec service opened: ", Service::exec_service_pid());
+
+                    std::string status_file =
+                            "/proc/" + std::to_string(Service::exec_service_pid()) + "/status";
+                    DumpFile("exec service: ", status_file);
+                    dumped_diagnostics = true;
+
+                    LOG(INFO) << "Attempting to handle any stuck SIGCHLDs...";
+                    HandleSignalFd(true);
+                }
+            }
+        }
+        if (!IsShuttingDown()) {
+            HandleControlMessages();
+            SetUsbController();
         }
     }
 
     return 0;
 }
+
+}  // namespace init
+}  // namespace android

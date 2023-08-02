@@ -14,8 +14,7 @@
  * limitations under the License.
  */
 
-#ifndef _INIT_ACTION_H
-#define _INIT_ACTION_H
+#pragma once
 
 #include <map>
 #include <queue>
@@ -24,20 +23,30 @@
 #include <vector>
 
 #include "builtins.h"
-#include "init_parser.h"
 #include "keyword_map.h"
+#include "result.h"
+#include "subcontext.h"
+
+namespace android {
+namespace init {
+
+Result<void> RunBuiltinFunction(const BuiltinFunction& function,
+                                const std::vector<std::string>& args, const std::string& context);
 
 class Command {
   public:
-    Command(BuiltinFunction f, const std::vector<std::string>& args, int line);
+    Command(BuiltinFunction f, bool execute_in_subcontext, std::vector<std::string>&& args,
+            int line);
 
-    int InvokeFunc() const;
+    Result<void> InvokeFunc(Subcontext* subcontext) const;
     std::string BuildCommandString() const;
+    Result<void> CheckCommand() const;
 
     int line() const { return line_; }
 
   private:
     BuiltinFunction func_;
+    bool execute_in_subcontext_;
     std::vector<std::string> args_;
     int line_;
 };
@@ -48,13 +57,13 @@ using BuiltinAction = class Action*;
 
 class Action {
   public:
-    explicit Action(bool oneshot, const std::string& filename, int line);
+    Action(bool oneshot, Subcontext* subcontext, const std::string& filename, int line,
+           const std::string& event_trigger,
+           const std::map<std::string, std::string>& property_triggers);
 
-    bool AddCommand(const std::vector<std::string>& args, int line, std::string* err);
-    void AddCommand(BuiltinFunction f, const std::vector<std::string>& args, int line);
-    bool InitTriggers(const std::vector<std::string>& args, std::string* err);
-    bool InitSingleTrigger(const std::string& trigger);
-    std::size_t NumCommands() const;
+    Result<void> AddCommand(std::vector<std::string>&& args, int line);
+    void AddCommand(BuiltinFunction f, std::vector<std::string>&& args, int line);
+    size_t NumCommands() const;
     void ExecuteOneCommand(std::size_t command) const;
     void ExecuteAllCommands() const;
     bool CheckEvent(const EventTrigger& event_trigger) const;
@@ -62,68 +71,29 @@ class Action {
     bool CheckEvent(const BuiltinAction& builtin_action) const;
     std::string BuildTriggersString() const;
     void DumpState() const;
+    size_t CheckAllCommands() const;
 
     bool oneshot() const { return oneshot_; }
     const std::string& filename() const { return filename_; }
     int line() const { return line_; }
-    static void set_function_map(const KeywordMap<BuiltinFunction>* function_map) {
+    static void set_function_map(const BuiltinFunctionMap* function_map) {
         function_map_ = function_map;
     }
 
-
-private:
+  private:
     void ExecuteCommand(const Command& command) const;
     bool CheckPropertyTriggers(const std::string& name = "",
                                const std::string& value = "") const;
-    bool ParsePropertyTrigger(const std::string& trigger, std::string* err);
 
     std::map<std::string, std::string> property_triggers_;
     std::string event_trigger_;
     std::vector<Command> commands_;
     bool oneshot_;
+    Subcontext* subcontext_;
     std::string filename_;
     int line_;
-    static const KeywordMap<BuiltinFunction>* function_map_;
+    static const BuiltinFunctionMap* function_map_;
 };
 
-class ActionManager {
-  public:
-    static ActionManager& GetInstance();
-
-    // Exposed for testing
-    ActionManager();
-
-    void AddAction(std::unique_ptr<Action> action);
-    void QueueEventTrigger(const std::string& trigger);
-    void QueuePropertyChange(const std::string& name, const std::string& value);
-    void QueueAllPropertyActions();
-    void QueueBuiltinAction(BuiltinFunction func, const std::string& name);
-    void ExecuteOneCommand();
-    bool HasMoreCommands() const;
-    void DumpState() const;
-
-  private:
-    ActionManager(ActionManager const&) = delete;
-    void operator=(ActionManager const&) = delete;
-
-    std::vector<std::unique_ptr<Action>> actions_;
-    std::queue<std::variant<EventTrigger, PropertyChange, BuiltinAction>> event_queue_;
-    std::queue<const Action*> current_executing_actions_;
-    std::size_t current_command_;
-};
-
-class ActionParser : public SectionParser {
-  public:
-    ActionParser(ActionManager* action_manager)
-        : action_manager_(action_manager), action_(nullptr) {}
-    bool ParseSection(std::vector<std::string>&& args, const std::string& filename, int line,
-                      std::string* err) override;
-    bool ParseLineSection(std::vector<std::string>&& args, int line, std::string* err) override;
-    void EndSection() override;
-
-  private:
-    ActionManager* action_manager_;
-    std::unique_ptr<Action> action_;
-};
-
-#endif
+}  // namespace init
+}  // namespace android

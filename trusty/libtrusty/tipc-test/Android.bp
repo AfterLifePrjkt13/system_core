@@ -12,15 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
 cc_test {
     name: "tipc-test",
-    static_executable: true,
+    vendor: true,
 
     srcs: ["tipc_test.c"],
-    static_libs: [
+    shared_libs: [
         "libc",
-        "libtrusty",
+        "libdmabufheap",
         "liblog",
+        "libtrusty",
     ],
     gtest: false,
+    cflags: [
+        "-Wall",
+        "-Werror",
+    ],
 }

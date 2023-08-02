@@ -37,25 +37,22 @@
 
 #include "dhcpmsg.h"
 
-int fatal();
+int fatal(const char*);
 
-int open_raw_socket(const char *ifname __attribute__((unused)), uint8_t *hwaddr, int if_index)
-{
-    int s;
-    struct sockaddr_ll bindaddr;
+int open_raw_socket(const char* ifname __unused, uint8_t hwaddr[ETH_ALEN], int if_index) {
+    int s = socket(PF_PACKET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (s < 0) return fatal("socket(PF_PACKET)");
 
-    if((s = socket(PF_PACKET, SOCK_DGRAM, htons(ETH_P_IP))) < 0) {
-        return fatal("socket(PF_PACKET)");
-    }
-
-    memset(&bindaddr, 0, sizeof(bindaddr));
-    bindaddr.sll_family = AF_PACKET;
-    bindaddr.sll_protocol = htons(ETH_P_IP);
-    bindaddr.sll_halen = ETH_ALEN;
+    struct sockaddr_ll bindaddr = {
+            .sll_family = AF_PACKET,
+            .sll_protocol = htons(ETH_P_IP),
+            .sll_ifindex = if_index,
+            .sll_halen = ETH_ALEN,
+    };
     memcpy(bindaddr.sll_addr, hwaddr, ETH_ALEN);
-    bindaddr.sll_ifindex = if_index;
 
     if (bind(s, (struct sockaddr *)&bindaddr, sizeof(bindaddr)) < 0) {
+        close(s);
         return fatal("Cannot bind raw socket to interface");
     }
 
@@ -218,6 +215,20 @@ int receive_packet(int s, struct dhcp_msg *msg)
      * to construct the pseudo header used in the checksum calculation.
      */
     dhcp_size = ntohs(packet.udp.len) - sizeof(packet.udp);
+    /*
+     * check validity of dhcp_size.
+     * 1) cannot be negative or zero.
+     * 2) src buffer contains enough bytes to copy
+     * 3) cannot exceed destination buffer
+     */
+    if ((dhcp_size <= 0) ||
+        ((int)(nread - sizeof(struct iphdr) - sizeof(struct udphdr)) < dhcp_size) ||
+        ((int)sizeof(struct dhcp_msg) < dhcp_size)) {
+#if VERBOSE
+        ALOGD("Malformed Packet");
+#endif
+        return -1;
+    }
     saddr = packet.ip.saddr;
     daddr = packet.ip.daddr;
     nread = ntohs(packet.ip.tot_len);

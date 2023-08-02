@@ -140,7 +140,9 @@
 // count, and accidentally passed to f(sp<T>), a strong pointer to the object
 // will be temporarily constructed and destroyed, prematurely deallocating the
 // object, and resulting in heap corruption. None of this would be easily
-// visible in the source.
+// visible in the source. See below on
+// ANDROID_UTILS_REF_BASE_DISABLE_IMPLICIT_CONSTRUCTION for a compile time
+// option which helps avoid this case.
 
 // Extra Features:
 
@@ -167,10 +169,48 @@
 // to THE SAME sp<> or wp<>.  In effect, their thread-safety properties are
 // exactly like those of T*, NOT atomic<T*>.
 
+// Safety option: ANDROID_UTILS_REF_BASE_DISABLE_IMPLICIT_CONSTRUCTION
+//
+// This flag makes the semantics for using a RefBase object with wp<> and sp<>
+// much stricter by disabling implicit conversion from raw pointers to these
+// objects. In order to use this, apply this flag in Android.bp like so:
+//
+//    cflags: [
+//        "-DANDROID_UTILS_REF_BASE_DISABLE_IMPLICIT_CONSTRUCTION",
+//    ],
+//
+// REGARDLESS of whether this flag is on, best usage of sp<> is shown below. If
+// this flag is on, no other usage is possible (directly calling RefBase methods
+// is possible, but seeing code using 'incStrong' instead of 'sp<>', for
+// instance, should already set off big alarm bells. With carefully constructed
+// data structures, it should NEVER be necessary to directly use RefBase
+// methods). Proper RefBase usage:
+//
+//    class Foo : virtual public RefBase { ... };
+//
+//    // always construct an sp object with sp::make
+//    sp<Foo> myFoo = sp<Foo>::make(/*args*/);
+//
+//    // if you need a weak pointer, it must be constructed from a strong
+//    // pointer
+//    wp<Foo> weakFoo = myFoo; // NOT myFoo.get()
+//
+//    // If you are inside of a method of Foo and need access to a strong
+//    // explicitly call this function. This documents your intention to code
+//    // readers, and it will give a runtime error for what otherwise would
+//    // be potential double ownership
+//    .... Foo::someMethod(...) {
+//        // asserts if there is a memory issue
+//        sp<Foo> thiz = sp<Foo>::fromExisting(this);
+//    }
+//
+
 #ifndef ANDROID_REF_BASE_H
 #define ANDROID_REF_BASE_H
 
 #include <atomic>
+#include <functional>
+#include <type_traits>  // for common_type.
 
 #include <stdint.h>
 #include <sys/types.h>
@@ -186,25 +226,29 @@
 // ---------------------------------------------------------------------------
 namespace android {
 
-class TextOutput;
-TextOutput& printWeakPointer(TextOutput& to, const void* val);
-
 // ---------------------------------------------------------------------------
 
 #define COMPARE_WEAK(_op_)                                      \
-inline bool operator _op_ (const sp<T>& o) const {              \
-    return m_ptr _op_ o.m_ptr;                                  \
-}                                                               \
-inline bool operator _op_ (const T* o) const {                  \
-    return m_ptr _op_ o;                                        \
-}                                                               \
-template<typename U>                                            \
-inline bool operator _op_ (const sp<U>& o) const {              \
-    return m_ptr _op_ o.m_ptr;                                  \
-}                                                               \
 template<typename U>                                            \
 inline bool operator _op_ (const U* o) const {                  \
     return m_ptr _op_ o;                                        \
+}                                                               \
+/* Needed to handle type inference for nullptr: */              \
+inline bool operator _op_ (const T* o) const {                  \
+    return m_ptr _op_ o;                                        \
+}
+
+template<template<typename C> class comparator, typename T, typename U>
+static inline bool _wp_compare_(T* a, U* b) {
+    return comparator<typename std::common_type<T*, U*>::type>()(a, b);
+}
+
+// Use std::less and friends to avoid undefined behavior when ordering pointers
+// to different objects.
+#define COMPARE_WEAK_FUNCTIONAL(_op_, _compare_)                 \
+template<typename U>                                             \
+inline bool operator _op_ (const U* o) const {                   \
+    return _wp_compare_<_compare_>(m_ptr, o);                    \
 }
 
 // ---------------------------------------------------------------------------
@@ -238,6 +282,7 @@ class RefBase
 {
 public:
             void            incStrong(const void* id) const;
+            void            incStrongRequireStrong(const void* id) const;
             void            decStrong(const void* id) const;
     
             void            forceIncStrong(const void* id) const;
@@ -251,6 +296,7 @@ public:
         RefBase*            refBase() const;
 
         void                incWeak(const void* id);
+        void                incWeakRequireWeak(const void* id);
         void                decWeak(const void* id);
 
         // acquires a strong reference if there is already one.
@@ -290,9 +336,12 @@ public:
         getWeakRefs()->trackMe(enable, retain); 
     }
 
-    typedef RefBase basetype;
-
 protected:
+    // When constructing these objects, prefer using sp::make<>. Using a RefBase
+    // object on the stack or with other refcount mechanisms (e.g.
+    // std::shared_ptr) is inherently wrong. RefBase types have an implicit
+    // ownership model and cannot be safely used with other ownership models.
+
                             RefBase();
     virtual                 ~RefBase();
     
@@ -354,12 +403,29 @@ class wp
 public:
     typedef typename RefBase::weakref_type weakref_type;
 
-    inline wp() : m_ptr(0) { }
+    inline wp() : m_ptr(nullptr), m_refs(nullptr) { }
 
+    // if nullptr, returns nullptr
+    //
+    // if a weak pointer is already available, this will retrieve it,
+    // otherwise, this will abort
+    static inline wp<T> fromExisting(T* other);
+
+    // for more information about this flag, see above
+#if defined(ANDROID_UTILS_REF_BASE_DISABLE_IMPLICIT_CONSTRUCTION)
+    wp(std::nullptr_t) : wp() {}
+#else
     wp(T* other);  // NOLINT(implicit)
+    template <typename U>
+    wp(U* other);  // NOLINT(implicit)
+    wp& operator=(T* other);
+    template <typename U>
+    wp& operator=(U* other);
+#endif
+
     wp(const wp<T>& other);
     explicit wp(const sp<T>& other);
-    template<typename U> wp(U* other);  // NOLINT(implicit)
+
     template<typename U> wp(const sp<U>& other);  // NOLINT(implicit)
     template<typename U> wp(const wp<U>& other);  // NOLINT(implicit)
 
@@ -367,11 +433,9 @@ public:
 
     // Assignment
 
-    wp& operator = (T* other);
     wp& operator = (const wp<T>& other);
     wp& operator = (const sp<T>& other);
 
-    template<typename U> wp& operator = (U* other);
     template<typename U> wp& operator = (const wp<U>& other);
     template<typename U> wp& operator = (const sp<U>& other);
 
@@ -395,39 +459,51 @@ public:
 
     COMPARE_WEAK(==)
     COMPARE_WEAK(!=)
-    COMPARE_WEAK(>)
-    COMPARE_WEAK(<)
-    COMPARE_WEAK(<=)
-    COMPARE_WEAK(>=)
+    COMPARE_WEAK_FUNCTIONAL(>, std::greater)
+    COMPARE_WEAK_FUNCTIONAL(<, std::less)
+    COMPARE_WEAK_FUNCTIONAL(<=, std::less_equal)
+    COMPARE_WEAK_FUNCTIONAL(>=, std::greater_equal)
 
-    inline bool operator == (const wp<T>& o) const {
-        return (m_ptr == o.m_ptr) && (m_refs == o.m_refs);
-    }
     template<typename U>
     inline bool operator == (const wp<U>& o) const {
-        return m_ptr == o.m_ptr;
+        return m_refs == o.m_refs;  // Implies m_ptr == o.mptr; see invariants below.
     }
 
-    inline bool operator > (const wp<T>& o) const {
-        return (m_ptr == o.m_ptr) ? (m_refs > o.m_refs) : (m_ptr > o.m_ptr);
+    template<typename U>
+    inline bool operator == (const sp<U>& o) const {
+        // Just comparing m_ptr fields is often dangerous, since wp<> may refer to an older
+        // object at the same address.
+        if (o == nullptr) {
+          return m_ptr == nullptr;
+        } else {
+          return m_refs == o->getWeakRefs();  // Implies m_ptr == o.mptr.
+        }
     }
+
+    template<typename U>
+    inline bool operator != (const sp<U>& o) const {
+        return !(*this == o);
+    }
+
     template<typename U>
     inline bool operator > (const wp<U>& o) const {
-        return (m_ptr == o.m_ptr) ? (m_refs > o.m_refs) : (m_ptr > o.m_ptr);
+        if (m_ptr == o.m_ptr) {
+            return _wp_compare_<std::greater>(m_refs, o.m_refs);
+        } else {
+            return _wp_compare_<std::greater>(m_ptr, o.m_ptr);
+        }
     }
 
-    inline bool operator < (const wp<T>& o) const {
-        return (m_ptr == o.m_ptr) ? (m_refs < o.m_refs) : (m_ptr < o.m_ptr);
-    }
     template<typename U>
     inline bool operator < (const wp<U>& o) const {
-        return (m_ptr == o.m_ptr) ? (m_refs < o.m_refs) : (m_ptr < o.m_ptr);
+        if (m_ptr == o.m_ptr) {
+            return _wp_compare_<std::less>(m_refs, o.m_refs);
+        } else {
+            return _wp_compare_<std::less>(m_ptr, o.m_ptr);
+        }
     }
-                         inline bool operator != (const wp<T>& o) const { return m_refs != o.m_refs; }
     template<typename U> inline bool operator != (const wp<U>& o) const { return !operator == (o); }
-                         inline bool operator <= (const wp<T>& o) const { return !operator > (o); }
     template<typename U> inline bool operator <= (const wp<U>& o) const { return !operator > (o); }
-                         inline bool operator >= (const wp<T>& o) const { return !operator < (o); }
     template<typename U> inline bool operator >= (const wp<U>& o) const { return !operator < (o); }
 
 private:
@@ -438,20 +514,74 @@ private:
     weakref_type*   m_refs;
 };
 
-template <typename T>
-TextOutput& operator<<(TextOutput& to, const wp<T>& val);
-
 #undef COMPARE_WEAK
+#undef COMPARE_WEAK_FUNCTIONAL
 
 // ---------------------------------------------------------------------------
 // No user serviceable parts below here.
 
+// Implementation invariants:
+// Either
+// 1) m_ptr and m_refs are both null, or
+// 2) m_refs == m_ptr->mRefs, or
+// 3) *m_ptr is no longer live, and m_refs points to the weakref_type object that corresponded
+//    to m_ptr while it was live. *m_refs remains live while a wp<> refers to it.
+//
+// The m_refs field in a RefBase object is allocated on construction, unique to that RefBase
+// object, and never changes. Thus if two wp's have identical m_refs fields, they are either both
+// null or point to the same object. If two wp's have identical m_ptr fields, they either both
+// point to the same live object and thus have the same m_ref fields, or at least one of the
+// objects is no longer live.
+//
+// Note that the above comparison operations go out of their way to provide an ordering consistent
+// with ordinary pointer comparison; otherwise they could ignore m_ptr, and just compare m_refs.
+
+template <typename T>
+wp<T> wp<T>::fromExisting(T* other) {
+    if (!other) return nullptr;
+
+    auto refs = other->getWeakRefs();
+    refs->incWeakRequireWeak(other);
+
+    wp<T> ret;
+    ret.m_ptr = other;
+    ret.m_refs = refs;
+    return ret;
+}
+
+#if !defined(ANDROID_UTILS_REF_BASE_DISABLE_IMPLICIT_CONSTRUCTION)
 template<typename T>
 wp<T>::wp(T* other)
     : m_ptr(other)
 {
-    if (other) m_refs = other->createWeak(this);
+    m_refs = other ? m_refs = other->createWeak(this) : nullptr;
 }
+
+template <typename T>
+template <typename U>
+wp<T>::wp(U* other) : m_ptr(other) {
+    m_refs = other ? other->createWeak(this) : nullptr;
+}
+
+template <typename T>
+wp<T>& wp<T>::operator=(T* other) {
+    weakref_type* newRefs = other ? other->createWeak(this) : nullptr;
+    if (m_ptr) m_refs->decWeak(this);
+    m_ptr = other;
+    m_refs = newRefs;
+    return *this;
+}
+
+template <typename T>
+template <typename U>
+wp<T>& wp<T>::operator=(U* other) {
+    weakref_type* newRefs = other ? other->createWeak(this) : 0;
+    if (m_ptr) m_refs->decWeak(this);
+    m_ptr = other;
+    m_refs = newRefs;
+    return *this;
+}
+#endif
 
 template<typename T>
 wp<T>::wp(const wp<T>& other)
@@ -464,16 +594,7 @@ template<typename T>
 wp<T>::wp(const sp<T>& other)
     : m_ptr(other.m_ptr)
 {
-    if (m_ptr) {
-        m_refs = m_ptr->createWeak(this);
-    }
-}
-
-template<typename T> template<typename U>
-wp<T>::wp(U* other)
-    : m_ptr(other)
-{
-    if (other) m_refs = other->createWeak(this);
+    m_refs = m_ptr ? m_ptr->createWeak(this) : nullptr;
 }
 
 template<typename T> template<typename U>
@@ -483,6 +604,8 @@ wp<T>::wp(const wp<U>& other)
     if (m_ptr) {
         m_refs = other.m_refs;
         m_refs->incWeak(this);
+    } else {
+        m_refs = nullptr;
     }
 }
 
@@ -490,26 +613,13 @@ template<typename T> template<typename U>
 wp<T>::wp(const sp<U>& other)
     : m_ptr(other.m_ptr)
 {
-    if (m_ptr) {
-        m_refs = m_ptr->createWeak(this);
-    }
+    m_refs = m_ptr ? m_ptr->createWeak(this) : nullptr;
 }
 
 template<typename T>
 wp<T>::~wp()
 {
     if (m_ptr) m_refs->decWeak(this);
-}
-
-template<typename T>
-wp<T>& wp<T>::operator = (T* other)
-{
-    weakref_type* newRefs =
-        other ? other->createWeak(this) : 0;
-    if (m_ptr) m_refs->decWeak(this);
-    m_ptr = other;
-    m_refs = newRefs;
-    return *this;
 }
 
 template<typename T>
@@ -528,21 +638,10 @@ template<typename T>
 wp<T>& wp<T>::operator = (const sp<T>& other)
 {
     weakref_type* newRefs =
-        other != NULL ? other->createWeak(this) : 0;
+        other != nullptr ? other->createWeak(this) : nullptr;
     T* otherPtr(other.m_ptr);
     if (m_ptr) m_refs->decWeak(this);
     m_ptr = otherPtr;
-    m_refs = newRefs;
-    return *this;
-}
-
-template<typename T> template<typename U>
-wp<T>& wp<T>::operator = (U* other)
-{
-    weakref_type* newRefs =
-        other ? other->createWeak(this) : 0;
-    if (m_ptr) m_refs->decWeak(this);
-    m_ptr = other;
     m_refs = newRefs;
     return *this;
 }
@@ -563,7 +662,7 @@ template<typename T> template<typename U>
 wp<T>& wp<T>::operator = (const sp<U>& other)
 {
     weakref_type* newRefs =
-        other != NULL ? other->createWeak(this) : 0;
+        other != nullptr ? other->createWeak(this) : 0;
     U* otherPtr(other.m_ptr);
     if (m_ptr) m_refs->decWeak(this);
     m_ptr = otherPtr;
@@ -595,14 +694,9 @@ void wp<T>::clear()
 {
     if (m_ptr) {
         m_refs->decWeak(this);
+        m_refs = 0;
         m_ptr = 0;
     }
-}
-
-template <typename T>
-inline TextOutput& operator<<(TextOutput& to, const wp<T>& val)
-{
-    return printWeakPointer(to, val.unsafe_get());
 }
 
 // ---------------------------------------------------------------------------
@@ -683,7 +777,7 @@ void move_backward_type(wp<TYPE>* d, wp<TYPE> const* s, size_t n) {
     ReferenceMover::move_references(d, s, n);
 }
 
-}; // namespace android
+}  // namespace android
 
 // ---------------------------------------------------------------------------
 

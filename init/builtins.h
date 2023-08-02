@@ -14,23 +14,32 @@
  * limitations under the License.
  */
 
-#ifndef _INIT_BUILTINS_H
-#define _INIT_BUILTINS_H
+#pragma once
 
 #include <functional>
 #include <map>
 #include <string>
 #include <vector>
 
+#include "builtin_arguments.h"
 #include "keyword_map.h"
+#include "result.h"
 
-using BuiltinFunction = std::function<int(const std::vector<std::string>&)>;
-class BuiltinFunctionMap : public KeywordMap<BuiltinFunction> {
-  public:
-    BuiltinFunctionMap() {}
+namespace android {
+namespace init {
 
-  private:
-    const Map& map() const override;
+using BuiltinFunction = std::function<Result<void>(const BuiltinArguments&)>;
+
+struct BuiltinFunctionMapValue {
+    bool run_in_subcontext;
+    BuiltinFunction function;
 };
 
-#endif
+using BuiltinFunctionMap = KeywordMap<BuiltinFunctionMapValue>;
+
+const BuiltinFunctionMap& GetBuiltinFunctionMap();
+
+extern std::vector<std::string> late_import_paths;
+
+}  // namespace init
+}  // namespace android

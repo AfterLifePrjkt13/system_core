@@ -16,83 +16,83 @@
 
 #include "util.h"
 
-#include <sys/socket.h>
+#include <time.h>
 
+#include <functional>
+#include <string>
 #include <utility>
 
-#include <android-base/unique_fd.h>
-#include <cutils/sockets.h>
+#include <android-base/file.h>
+#include <android-base/stringprintf.h>
+#include <android-base/strings.h>
 #include "protocol.h"
 
-using android::base::unique_fd;
+std::vector<std::string> get_command_line(pid_t pid) {
+  std::vector<std::string> result;
 
-ssize_t send_fd(int sockfd, const void* data, size_t len, unique_fd fd) {
-  char cmsg_buf[CMSG_SPACE(sizeof(int))];
+  std::string cmdline;
+  android::base::ReadFileToString(android::base::StringPrintf("/proc/%d/cmdline", pid), &cmdline);
 
-  iovec iov = { .iov_base = const_cast<void*>(data), .iov_len = len };
-  msghdr msg = {
-    .msg_iov = &iov, .msg_iovlen = 1, .msg_control = cmsg_buf, .msg_controllen = sizeof(cmsg_buf),
-  };
-  auto cmsg = CMSG_FIRSTHDR(&msg);
-  cmsg->cmsg_level = SOL_SOCKET;
-  cmsg->cmsg_type = SCM_RIGHTS;
-  cmsg->cmsg_len = CMSG_LEN(sizeof(int));
-  *reinterpret_cast<int*>(CMSG_DATA(cmsg)) = fd.get();
-
-  return TEMP_FAILURE_RETRY(sendmsg(sockfd, &msg, 0));
-}
-
-ssize_t recv_fd(int sockfd, void* _Nonnull data, size_t len, unique_fd* _Nullable out_fd) {
-  char cmsg_buf[CMSG_SPACE(sizeof(int))];
-
-  iovec iov = { .iov_base = const_cast<void*>(data), .iov_len = len };
-  msghdr msg = {
-    .msg_iov = &iov,
-    .msg_iovlen = 1,
-    .msg_control = cmsg_buf,
-    .msg_controllen = sizeof(cmsg_buf),
-    .msg_flags = 0,
-  };
-  auto cmsg = CMSG_FIRSTHDR(&msg);
-  cmsg->cmsg_level = SOL_SOCKET;
-  cmsg->cmsg_type = SCM_RIGHTS;
-  cmsg->cmsg_len = CMSG_LEN(sizeof(int));
-
-  ssize_t result = TEMP_FAILURE_RETRY(recvmsg(sockfd, &msg, 0));
-  if (result == -1) {
-    return -1;
+  auto it = cmdline.cbegin();
+  while (it != cmdline.cend()) {
+    // string::iterator is a wrapped type, not a raw char*.
+    auto terminator = std::find(it, cmdline.cend(), '\0');
+    result.emplace_back(it, terminator);
+    it = std::find_if(terminator, cmdline.cend(), [](char c) { return c != '\0'; });
   }
-
-  unique_fd fd;
-  bool received_fd = msg.msg_controllen == sizeof(cmsg_buf);
-  if (received_fd) {
-    fd.reset(*reinterpret_cast<int*>(CMSG_DATA(cmsg)));
-  }
-
-  if ((msg.msg_flags & MSG_TRUNC) != 0) {
-    errno = EFBIG;
-    return -1;
-  } else if ((msg.msg_flags & MSG_CTRUNC) != 0) {
-    errno = ERANGE;
-    return -1;
-  }
-
-  if (out_fd) {
-    *out_fd = std::move(fd);
-  } else if (received_fd) {
-    errno = ERANGE;
-    return -1;
+  if (result.empty()) {
+    result.emplace_back("<unknown>");
   }
 
   return result;
 }
 
-bool Pipe(unique_fd* read, unique_fd* write) {
-  int pipefds[2];
-  if (pipe(pipefds) != 0) {
+std::string get_process_name(pid_t pid) {
+  std::string result = "<unknown>";
+  android::base::ReadFileToString(android::base::StringPrintf("/proc/%d/cmdline", pid), &result);
+  // We only want the name, not the whole command line, so truncate at the first NUL.
+  return result.c_str();
+}
+
+std::string get_thread_name(pid_t tid) {
+  std::string result = "<unknown>";
+  android::base::ReadFileToString(android::base::StringPrintf("/proc/%d/comm", tid), &result);
+  return android::base::Trim(result);
+}
+
+std::string get_timestamp() {
+  timespec ts;
+  clock_gettime(CLOCK_REALTIME, &ts);
+
+  tm tm;
+  localtime_r(&ts.tv_sec, &tm);
+
+  char buf[strlen("1970-01-01 00:00:00.123456789+0830") + 1];
+  char* s = buf;
+  size_t sz = sizeof(buf), n;
+  n = strftime(s, sz, "%F %H:%M", &tm), s += n, sz -= n;
+  n = snprintf(s, sz, ":%02d.%09ld", tm.tm_sec, ts.tv_nsec), s += n, sz -= n;
+  n = strftime(s, sz, "%z", &tm), s += n, sz -= n;
+  return buf;
+}
+
+bool iterate_tids(pid_t pid, std::function<void(pid_t)> callback) {
+  char buf[BUFSIZ];
+  snprintf(buf, sizeof(buf), "/proc/%d/task", pid);
+  std::unique_ptr<DIR, int (*)(DIR*)> dir(opendir(buf), closedir);
+  if (dir == nullptr) {
     return false;
   }
-  read->reset(pipefds[0]);
-  write->reset(pipefds[1]);
+
+  struct dirent* entry;
+  while ((entry = readdir(dir.get())) != nullptr) {
+    pid_t tid = atoi(entry->d_name);
+    if (tid == 0) {
+      continue;
+    }
+    if (pid != tid) {
+      callback(tid);
+    }
+  }
   return true;
 }

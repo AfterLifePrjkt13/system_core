@@ -57,6 +57,12 @@ void GetObservedEvents(FuseBridgeState state, int* device_events, int* proxy_eve
             return;
     }
 }
+
+void LogResponseError(const std::string& message, const FuseResponse& response) {
+    LOG(ERROR) << message << ": header.len=" << response.header.len
+               << " header.error=" << response.header.error
+               << " header.unique=" << response.header.unique;
+}
 }
 
 class FuseBridgeEntry {
@@ -80,6 +86,7 @@ class FuseBridgeEntry {
         const bool proxy_read_ready = last_proxy_events_.events & EPOLLIN;
         const bool proxy_write_ready = last_proxy_events_.events & EPOLLOUT;
 
+        last_state_ = state_;
         last_device_events_.events = 0;
         last_proxy_events_.events = 0;
 
@@ -135,6 +142,7 @@ class FuseBridgeEntry {
         }
 
         if (!buffer_.response.Write(device_fd_)) {
+            LogResponseError("Failed to write a reply from proxy to device", buffer_.response);
             return FuseBridgeState::kClosing;
         }
 
@@ -172,7 +180,11 @@ class FuseBridgeEntry {
         }
 
         const uint32_t opcode = buffer_.request.header.opcode;
-        LOG(VERBOSE) << "Read a fuse packet, opcode=" << opcode;
+        const uint64_t unique = buffer_.request.header.unique;
+        LOG(VERBOSE) << "Read a fuse packet, opcode=" << opcode << " unique=" << unique;
+        if (unique == 0) {
+            return FuseBridgeState::kWaitToReadEither;
+        }
         switch (opcode) {
             case FUSE_FORGET:
                 // Do not reply to FUSE_FORGET.
@@ -200,6 +212,7 @@ class FuseBridgeEntry {
         }
 
         if (!buffer_.response.Write(device_fd_)) {
+            LogResponseError("Failed to write a response to device", buffer_.response);
             return FuseBridgeState::kClosing;
         }
 
@@ -215,6 +228,11 @@ class FuseBridgeEntry {
             case ResultOrAgain::kSuccess:
                 return FuseBridgeState::kWaitToReadEither;
             case ResultOrAgain::kFailure:
+                LOG(ERROR) << "Failed to write a request to proxy:"
+                           << " header.len=" << buffer_.request.header.len
+                           << " header.opcode=" << buffer_.request.header.opcode
+                           << " header.unique=" << buffer_.request.header.unique
+                           << " header.nodeid=" << buffer_.request.header.nodeid;
                 return FuseBridgeState::kClosing;
             case ResultOrAgain::kAgain:
                 return FuseBridgeState::kWaitToWriteProxy;
@@ -293,8 +311,10 @@ class BridgeEpollController : private EpollController {
     }
 };
 
+std::recursive_mutex FuseBridgeLoop::mutex_;
+
 FuseBridgeLoop::FuseBridgeLoop() : opened_(true) {
-    base::unique_fd epoll_fd(epoll_create1(/* no flag */ 0));
+    base::unique_fd epoll_fd(epoll_create1(EPOLL_CLOEXEC));
     if (epoll_fd.get() == -1) {
         PLOG(ERROR) << "Failed to open FD for epoll";
         opened_ = false;
@@ -310,7 +330,7 @@ bool FuseBridgeLoop::AddBridge(int mount_id, base::unique_fd dev_fd, base::uniqu
 
     std::unique_ptr<FuseBridgeEntry> bridge(
         new FuseBridgeEntry(mount_id, std::move(dev_fd), std::move(proxy_fd)));
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!opened_) {
         LOG(ERROR) << "Tried to add a mount to a closed bridge";
         return false;
@@ -336,8 +356,8 @@ bool FuseBridgeLoop::ProcessEventLocked(const std::unordered_set<FuseBridgeEntry
         }
         if (entry->IsClosing()) {
             const int mount_id = entry->mount_id();
-            callback->OnClosed(mount_id);
             bridges_.erase(mount_id);
+            callback->OnClosed(mount_id);
             if (bridges_.size() == 0) {
                 // All bridges are now closed.
                 return false;
@@ -354,7 +374,7 @@ void FuseBridgeLoop::Start(FuseBridgeLoopCallback* callback) {
         const bool wait_result = epoll_controller_->Wait(bridges_.size(), &entries);
         LOG(VERBOSE) << "Receive epoll events";
         {
-            std::lock_guard<std::mutex> lock(mutex_);
+            std::lock_guard<std::recursive_mutex> lock(mutex_);
             if (!(wait_result && ProcessEventLocked(entries, callback))) {
                 for (auto it = bridges_.begin(); it != bridges_.end();) {
                     callback->OnClosed(it->second->mount_id());
@@ -365,6 +385,14 @@ void FuseBridgeLoop::Start(FuseBridgeLoopCallback* callback) {
             }
         }
     }
+}
+
+void FuseBridgeLoop::Lock() {
+    mutex_.lock();
+}
+
+void FuseBridgeLoop::Unlock() {
+    mutex_.unlock();
 }
 
 }  // namespace fuse

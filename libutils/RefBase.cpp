@@ -17,30 +17,49 @@
 #define LOG_TAG "RefBase"
 // #define LOG_NDEBUG 0
 
+#include <memory>
+
+#include <android-base/macros.h>
+
+#include <log/log.h>
+
 #include <utils/RefBase.h>
 
-#include <utils/CallStack.h>
+#include <utils/Mutex.h>
 
 #ifndef __unused
 #define __unused __attribute__((__unused__))
 #endif
 
-// compile with refcounting debugging enabled
-#define DEBUG_REFS                      0
+// Compile with refcounting debugging enabled.
+#define DEBUG_REFS 0
+
+// The following three are ignored unless DEBUG_REFS is set.
 
 // whether ref-tracking is enabled by default, if not, trackMe(true, false)
 // needs to be called explicitly
-#define DEBUG_REFS_ENABLED_BY_DEFAULT   0
+#define DEBUG_REFS_ENABLED_BY_DEFAULT 0
 
 // whether callstack are collected (significantly slows things down)
-#define DEBUG_REFS_CALLSTACK_ENABLED    1
+#define DEBUG_REFS_CALLSTACK_ENABLED 1
 
 // folder where stack traces are saved when DEBUG_REFS is enabled
 // this folder needs to exist and be writable
-#define DEBUG_REFS_CALLSTACK_PATH       "/data/debug"
+#define DEBUG_REFS_CALLSTACK_PATH "/data/debug"
 
 // log all reference counting operations
-#define PRINT_REFS                      0
+#define PRINT_REFS 0
+
+#if defined(__linux__)
+// CallStack is only supported on linux type platforms.
+#define CALLSTACK_ENABLED 1
+#else
+#define CALLSTACK_ENABLED 0
+#endif
+
+#if CALLSTACK_ENABLED
+#include <utils/CallStack.h>
+#endif
 
 // ---------------------------------------------------------------------------
 
@@ -146,7 +165,7 @@ public:
         : mStrong(INITIAL_STRONG_VALUE)
         , mWeak(0)
         , mBase(base)
-        , mFlags(0)
+        , mFlags(OBJECT_LIFETIME_STRONG)
     {
     }
 
@@ -165,14 +184,14 @@ public:
         : mStrong(INITIAL_STRONG_VALUE)
         , mWeak(0)
         , mBase(base)
-        , mFlags(0)
+        , mFlags(OBJECT_LIFETIME_STRONG)
         , mStrongRefs(NULL)
         , mWeakRefs(NULL)
         , mTrackEnabled(!!DEBUG_REFS_ENABLED_BY_DEFAULT)
         , mRetain(false)
     {
     }
-    
+
     ~weakref_impl()
     {
         bool dumpStack = false;
@@ -183,8 +202,8 @@ public:
             while (refs) {
                 char inc = refs->ref >= 0 ? '+' : '-';
                 ALOGD("\t%c ID %p (ref %d):", inc, refs->id, refs->ref);
-#if DEBUG_REFS_CALLSTACK_ENABLED
-                refs->stack.log(LOG_TAG);
+#if DEBUG_REFS_CALLSTACK_ENABLED && CALLSTACK_ENABLED
+                CallStack::logStack(LOG_TAG, refs->stack.get());
 #endif
                 refs = refs->next;
             }
@@ -197,15 +216,17 @@ public:
             while (refs) {
                 char inc = refs->ref >= 0 ? '+' : '-';
                 ALOGD("\t%c ID %p (ref %d):", inc, refs->id, refs->ref);
-#if DEBUG_REFS_CALLSTACK_ENABLED
-                refs->stack.log(LOG_TAG);
+#if DEBUG_REFS_CALLSTACK_ENABLED && CALLSTACK_ENABLED
+                CallStack::logStack(LOG_TAG, refs->stack.get());
 #endif
                 refs = refs->next;
             }
         }
         if (dumpStack) {
             ALOGE("above errors at:");
-            CallStack stack(LOG_TAG);
+#if CALLSTACK_ENABLED
+            CallStack::logStack(LOG_TAG);
+#endif
         }
     }
 
@@ -248,8 +269,7 @@ public:
         renameRefsId(mWeakRefs, old_id, new_id);
     }
 
-    void trackMe(bool track, bool retain)
-    { 
+    void trackMe(bool track, bool retain) {
         mTrackEnabled = track;
         mRetain = retain;
     }
@@ -279,7 +299,7 @@ public:
                      this);
             int rc = open(name, O_RDWR | O_CREAT | O_APPEND, 644);
             if (rc >= 0) {
-                write(rc, text.string(), text.length());
+                (void)write(rc, text.string(), text.length());
                 close(rc);
                 ALOGD("STACK TRACE for %p saved in %s", this, name);
             }
@@ -293,8 +313,8 @@ private:
     {
         ref_entry* next;
         const void* id;
-#if DEBUG_REFS_CALLSTACK_ENABLED
-        CallStack stack;
+#if DEBUG_REFS_CALLSTACK_ENABLED && CALLSTACK_ENABLED
+        CallStack::CallStackUPtr stack;
 #endif
         int32_t ref;
     };
@@ -310,8 +330,8 @@ private:
             // decrement the reference count.
             ref->ref = mRef;
             ref->id = id;
-#if DEBUG_REFS_CALLSTACK_ENABLED
-            ref->stack.update(2);
+#if DEBUG_REFS_CALLSTACK_ENABLED && CALLSTACK_ENABLED
+            ref->stack = CallStack::getCurrent(2);
 #endif
             ref->next = *refs;
             *refs = ref;
@@ -322,7 +342,7 @@ private:
     {
         if (mTrackEnabled) {
             AutoMutex _l(mMutex);
-            
+
             ref_entry* const head = *refs;
             ref_entry* ref = head;
             while (ref != NULL) {
@@ -346,7 +366,9 @@ private:
                 ref = ref->next;
             }
 
-            CallStack stack(LOG_TAG);
+#if CALLSTACK_ENABLED
+            CallStack::logStack(LOG_TAG);
+#endif
         }
     }
 
@@ -372,8 +394,8 @@ private:
             snprintf(buf, sizeof(buf), "\t%c ID %p (ref %d):\n",
                      inc, refs->id, refs->ref);
             out->append(buf);
-#if DEBUG_REFS_CALLSTACK_ENABLED
-            out->append(refs->stack.toString("\t\t"));
+#if DEBUG_REFS_CALLSTACK_ENABLED && CALLSTACK_ENABLED
+            out->append(CallStack::stackToString("\t\t", refs->stack.get()));
 #else
             out->append("\t\t(call stacks disabled)");
 #endif
@@ -399,7 +421,7 @@ void RefBase::incStrong(const void* id) const
 {
     weakref_impl* const refs = mRefs;
     refs->incWeak(id);
-    
+
     refs->addStrongRef(id);
     const int32_t c = refs->mStrong.fetch_add(1, std::memory_order_relaxed);
     ALOG_ASSERT(c > 0, "incStrong() called on %p after last strong ref", refs);
@@ -410,11 +432,24 @@ void RefBase::incStrong(const void* id) const
         return;
     }
 
-    int32_t old = refs->mStrong.fetch_sub(INITIAL_STRONG_VALUE,
-            std::memory_order_relaxed);
+    int32_t old __unused = refs->mStrong.fetch_sub(INITIAL_STRONG_VALUE, std::memory_order_relaxed);
     // A decStrong() must still happen after us.
     ALOG_ASSERT(old > INITIAL_STRONG_VALUE, "0x%x too small", old);
     refs->mBase->onFirstRef();
+}
+
+void RefBase::incStrongRequireStrong(const void* id) const {
+    weakref_impl* const refs = mRefs;
+    refs->incWeak(id);
+
+    refs->addStrongRef(id);
+    const int32_t c = refs->mStrong.fetch_add(1, std::memory_order_relaxed);
+
+    LOG_ALWAYS_FATAL_IF(c <= 0 || c == INITIAL_STRONG_VALUE,
+                        "incStrongRequireStrong() called on %p which isn't already owned", refs);
+#if PRINT_REFS
+    ALOGD("incStrong (requiring strong) of %p from %p: cnt=%d\n", this, id, c);
+#endif
 }
 
 void RefBase::decStrong(const void* id) const
@@ -442,6 +477,11 @@ void RefBase::decStrong(const void* id) const
     // and all accesses to refs happen before its deletion in the final decWeak.
     // The destructor can safely access mRefs because either it's deleting
     // mRefs itself, or it's running entirely before the final mWeak decrement.
+    //
+    // Since we're doing atomic loads of `flags`, the static analyzer assumes
+    // they can change between `delete this;` and `refs->decWeak(id);`. This is
+    // not the case. The analyzer may become more okay with this patten when
+    // https://bugs.llvm.org/show_bug.cgi?id=34365 gets resolved. NOLINTNEXTLINE
     refs->decWeak(id);
 }
 
@@ -451,7 +491,7 @@ void RefBase::forceIncStrong(const void* id) const
     // TODO: Better document assumptions.
     weakref_impl* const refs = mRefs;
     refs->incWeak(id);
-    
+
     refs->addStrongRef(id);
     const int32_t c = refs->mStrong.fetch_add(1, std::memory_order_relaxed);
     ALOG_ASSERT(c >= 0, "forceIncStrong called on %p after ref count underflow",
@@ -464,7 +504,7 @@ void RefBase::forceIncStrong(const void* id) const
     case INITIAL_STRONG_VALUE:
         refs->mStrong.fetch_sub(INITIAL_STRONG_VALUE,
                 std::memory_order_relaxed);
-        // fall through...
+        FALLTHROUGH_INTENDED;
     case 0:
         refs->mBase->onFirstRef();
     }
@@ -490,6 +530,14 @@ void RefBase::weakref_type::incWeak(const void* id)
     ALOG_ASSERT(c >= 0, "incWeak called on %p after last weak ref", this);
 }
 
+void RefBase::weakref_type::incWeakRequireWeak(const void* id)
+{
+    weakref_impl* const impl = static_cast<weakref_impl*>(this);
+    impl->addWeakRef(id);
+    const int32_t c __unused = impl->mWeak.fetch_add(1,
+            std::memory_order_relaxed);
+    LOG_ALWAYS_FATAL_IF(c <= 0, "incWeakRequireWeak called on %p which has no weak refs", this);
+}
 
 void RefBase::weakref_type::decWeak(const void* id)
 {
@@ -533,7 +581,7 @@ void RefBase::weakref_type::decWeak(const void* id)
 bool RefBase::weakref_type::attemptIncStrong(const void* id)
 {
     incWeak(id);
-    
+
     weakref_impl* const impl = static_cast<weakref_impl*>(this);
     int32_t curCount = impl->mStrong.load(std::memory_order_relaxed);
 
@@ -550,7 +598,7 @@ bool RefBase::weakref_type::attemptIncStrong(const void* id)
         // the strong count has changed on us, we need to re-assert our
         // situation. curCount was updated by compare_exchange_weak.
     }
-    
+
     if (curCount <= 0 || curCount == INITIAL_STRONG_VALUE) {
         // we're now in the harder case of either:
         // - there never was a strong reference on us
@@ -607,7 +655,7 @@ bool RefBase::weakref_type::attemptIncStrong(const void* id)
             }
         }
     }
-    
+
     impl->addStrongRef(id);
 
 #if PRINT_REFS
@@ -696,19 +744,24 @@ RefBase::~RefBase()
         if (mRefs->mWeak.load(std::memory_order_relaxed) == 0) {
             delete mRefs;
         }
-    } else if (mRefs->mStrong.load(std::memory_order_relaxed)
-            == INITIAL_STRONG_VALUE) {
+    } else if (mRefs->mStrong.load(std::memory_order_relaxed) == INITIAL_STRONG_VALUE) {
         // We never acquired a strong reference on this object.
-        LOG_ALWAYS_FATAL_IF(mRefs->mWeak.load() != 0,
-                "RefBase: Explicit destruction with non-zero weak "
-                "reference count");
-        // TODO: Always report if we get here. Currently MediaMetadataRetriever
-        // C++ objects are inconsistently managed and sometimes get here.
-        // There may be other cases, but we believe they should all be fixed.
-        delete mRefs;
+
+        // TODO: make this fatal, but too much code in Android manages RefBase with
+        // new/delete manually (or using other mechanisms such as std::make_unique).
+        // However, this is dangerous because it's also common for code to use the
+        // sp<T>(T*) constructor, assuming that if the object is around, it is already
+        // owned by an sp<>.
+        ALOGW("RefBase: Explicit destruction, weak count = %d (in %p). Use sp<> to manage this "
+              "object.",
+              mRefs->mWeak.load(), this);
+
+#if CALLSTACK_ENABLED
+        CallStack::logStack(LOG_TAG);
+#endif
     }
     // For debugging purposes, clear mRefs.  Ineffective against outstanding wp's.
-    const_cast<weakref_impl*&>(mRefs) = NULL;
+    const_cast<weakref_impl*&>(mRefs) = nullptr;
 }
 
 void RefBase::extendObjectLifetime(int32_t mode)

@@ -19,6 +19,9 @@
 
 #include <string>
 
+namespace android {
+namespace init {
+
 struct Uevent {
     std::string action;
     std::string path;
@@ -26,9 +29,13 @@ struct Uevent {
     std::string firmware;
     std::string partition_name;
     std::string device_name;
+    std::string modalias;
     int partition_num;
     int major;
     int minor;
 };
+
+}  // namespace init
+}  // namespace android
 
 #endif

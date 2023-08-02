@@ -14,11 +14,15 @@
  * limitations under the License.
  */
 
-#ifndef __CORE_FS_MGR_PRIV_H
-#define __CORE_FS_MGR_PRIV_H
+#pragma once
+
+#include <chrono>
+#include <string>
 
 #include <android-base/logging.h>
 #include <fs_mgr.h>
+#include <fstab/fstab.h>
+
 #include "fs_mgr_priv_boot_config.h"
 
 /* The CHECK() in logging.h will use program invocation name as the tag.
@@ -35,15 +39,15 @@
 #define LINFO    LOG(INFO) << FS_MGR_TAG
 #define LWARNING LOG(WARNING) << FS_MGR_TAG
 #define LERROR   LOG(ERROR) << FS_MGR_TAG
+#define LFATAL LOG(FATAL) << FS_MGR_TAG
 
 // Logs a message with strerror(errno) at the end
 #define PINFO    PLOG(INFO) << FS_MGR_TAG
 #define PWARNING PLOG(WARNING) << FS_MGR_TAG
 #define PERROR   PLOG(ERROR) << FS_MGR_TAG
+#define PFATAL PLOG(FATAL) << FS_MGR_TAG
 
-#define CRYPTO_TMPFS_OPTIONS "size=256m,mode=0771,uid=1000,gid=1000"
-
-#define WAIT_TIMEOUT 20
+#define CRYPTO_TMPFS_OPTIONS "size=512m,mode=0771,uid=1000,gid=1000"
 
 /* fstab has the following format:
  *
@@ -80,42 +84,23 @@
  *
  */
 
-#define MF_WAIT                  0x1
-#define MF_CHECK                 0x2
-#define MF_CRYPT                 0x4
-#define MF_NONREMOVABLE          0x8
-#define MF_VOLDMANAGED          0x10
-#define MF_LENGTH               0x20
-#define MF_RECOVERYONLY         0x40
-#define MF_SWAPPRIO             0x80
-#define MF_ZRAMSIZE            0x100
-#define MF_VERIFY              0x200
-#define MF_FORCECRYPT          0x400
-#define MF_NOEMULATEDSD        0x800 /* no emulated sdcard daemon, sd card is the only
-                                        external storage */
-#define MF_NOTRIM             0x1000
-#define MF_FILEENCRYPTION     0x2000
-#define MF_FORMATTABLE        0x4000
-#define MF_SLOTSELECT         0x8000
-#define MF_FORCEFDEORFBE     0x10000
-#define MF_LATEMOUNT         0x20000
-#define MF_NOFAIL            0x40000
-#define MF_VERIFYATBOOT      0x80000
-#define MF_MAX_COMP_STREAMS 0x100000
-#define MF_RESERVEDSIZE     0x200000
-#define MF_QUOTA            0x400000
-#define MF_ERASEBLKSIZE     0x800000
-#define MF_LOGICALBLKSIZE  0X1000000
-#define MF_AVB             0X2000000
-#define MF_KEYDIRECTORY 0X4000000
-
 #define DM_BUF_SIZE 4096
 
-int fs_mgr_set_blk_ro(const char *blockdev);
-int fs_mgr_test_access(const char *device);
-bool fs_mgr_update_for_slotselect(struct fstab *fstab);
-bool is_dt_compatible();
-bool is_device_secure();
-int load_verity_state(struct fstab_rec* fstab, int* mode);
+using namespace std::chrono_literals;
 
-#endif /* __CORE_FS_MGR_PRIV_H */
+bool fs_mgr_set_blk_ro(const std::string& blockdev, bool readonly = true);
+bool fs_mgr_update_for_slotselect(android::fs_mgr::Fstab* fstab);
+bool fs_mgr_is_device_unlocked();
+const std::string& get_android_dt_dir();
+bool is_dt_compatible();
+
+bool fs_mgr_is_ext4(const std::string& blk_device);
+bool fs_mgr_is_f2fs(const std::string& blk_device);
+
+bool fs_mgr_teardown_verity(android::fs_mgr::FstabEntry* fstab);
+
+namespace android {
+namespace fs_mgr {
+bool UnmapDevice(const std::string& name);
+}  // namespace fs_mgr
+}  // namespace android

@@ -14,7 +14,6 @@
 
 #include "capabilities.h"
 
-#include <sys/capability.h>
 #include <sys/prctl.h>
 
 #include <map>
@@ -25,54 +24,71 @@
 
 #define CAP_MAP_ENTRY(cap) { #cap, CAP_##cap }
 
+namespace android {
+namespace init {
+
 static const std::map<std::string, int> cap_map = {
-    CAP_MAP_ENTRY(CHOWN),
-    CAP_MAP_ENTRY(DAC_OVERRIDE),
-    CAP_MAP_ENTRY(DAC_READ_SEARCH),
-    CAP_MAP_ENTRY(FOWNER),
-    CAP_MAP_ENTRY(FSETID),
-    CAP_MAP_ENTRY(KILL),
-    CAP_MAP_ENTRY(SETGID),
-    CAP_MAP_ENTRY(SETUID),
-    CAP_MAP_ENTRY(SETPCAP),
-    CAP_MAP_ENTRY(LINUX_IMMUTABLE),
-    CAP_MAP_ENTRY(NET_BIND_SERVICE),
-    CAP_MAP_ENTRY(NET_BROADCAST),
-    CAP_MAP_ENTRY(NET_ADMIN),
-    CAP_MAP_ENTRY(NET_RAW),
-    CAP_MAP_ENTRY(IPC_LOCK),
-    CAP_MAP_ENTRY(IPC_OWNER),
-    CAP_MAP_ENTRY(SYS_MODULE),
-    CAP_MAP_ENTRY(SYS_RAWIO),
-    CAP_MAP_ENTRY(SYS_CHROOT),
-    CAP_MAP_ENTRY(SYS_PTRACE),
-    CAP_MAP_ENTRY(SYS_PACCT),
-    CAP_MAP_ENTRY(SYS_ADMIN),
-    CAP_MAP_ENTRY(SYS_BOOT),
-    CAP_MAP_ENTRY(SYS_NICE),
-    CAP_MAP_ENTRY(SYS_RESOURCE),
-    CAP_MAP_ENTRY(SYS_TIME),
-    CAP_MAP_ENTRY(SYS_TTY_CONFIG),
-    CAP_MAP_ENTRY(MKNOD),
-    CAP_MAP_ENTRY(LEASE),
-    CAP_MAP_ENTRY(AUDIT_WRITE),
-    CAP_MAP_ENTRY(AUDIT_CONTROL),
-    CAP_MAP_ENTRY(SETFCAP),
-    CAP_MAP_ENTRY(MAC_OVERRIDE),
-    CAP_MAP_ENTRY(MAC_ADMIN),
-    CAP_MAP_ENTRY(SYSLOG),
-    CAP_MAP_ENTRY(WAKE_ALARM),
-    CAP_MAP_ENTRY(BLOCK_SUSPEND),
-    CAP_MAP_ENTRY(AUDIT_READ),
+        CAP_MAP_ENTRY(CHOWN),
+        CAP_MAP_ENTRY(DAC_OVERRIDE),
+        CAP_MAP_ENTRY(DAC_READ_SEARCH),
+        CAP_MAP_ENTRY(FOWNER),
+        CAP_MAP_ENTRY(FSETID),
+        CAP_MAP_ENTRY(KILL),
+        CAP_MAP_ENTRY(SETGID),
+        CAP_MAP_ENTRY(SETUID),
+        CAP_MAP_ENTRY(SETPCAP),
+        CAP_MAP_ENTRY(LINUX_IMMUTABLE),
+        CAP_MAP_ENTRY(NET_BIND_SERVICE),
+        CAP_MAP_ENTRY(NET_BROADCAST),
+        CAP_MAP_ENTRY(NET_ADMIN),
+        CAP_MAP_ENTRY(NET_RAW),
+        CAP_MAP_ENTRY(IPC_LOCK),
+        CAP_MAP_ENTRY(IPC_OWNER),
+        CAP_MAP_ENTRY(SYS_MODULE),
+        CAP_MAP_ENTRY(SYS_RAWIO),
+        CAP_MAP_ENTRY(SYS_CHROOT),
+        CAP_MAP_ENTRY(SYS_PTRACE),
+        CAP_MAP_ENTRY(SYS_PACCT),
+        CAP_MAP_ENTRY(SYS_ADMIN),
+        CAP_MAP_ENTRY(SYS_BOOT),
+        CAP_MAP_ENTRY(SYS_NICE),
+        CAP_MAP_ENTRY(SYS_RESOURCE),
+        CAP_MAP_ENTRY(SYS_TIME),
+        CAP_MAP_ENTRY(SYS_TTY_CONFIG),
+        CAP_MAP_ENTRY(MKNOD),
+        CAP_MAP_ENTRY(LEASE),
+        CAP_MAP_ENTRY(AUDIT_WRITE),
+        CAP_MAP_ENTRY(AUDIT_CONTROL),
+        CAP_MAP_ENTRY(SETFCAP),
+        CAP_MAP_ENTRY(MAC_OVERRIDE),
+        CAP_MAP_ENTRY(MAC_ADMIN),
+        CAP_MAP_ENTRY(SYSLOG),
+        CAP_MAP_ENTRY(WAKE_ALARM),
+        CAP_MAP_ENTRY(BLOCK_SUSPEND),
+        CAP_MAP_ENTRY(AUDIT_READ),
+#if defined(__BIONIC__)
+        CAP_MAP_ENTRY(PERFMON),
+        CAP_MAP_ENTRY(BPF),
+        CAP_MAP_ENTRY(CHECKPOINT_RESTORE),
+#endif
 };
 
+#if defined(__BIONIC__)
+static_assert(CAP_LAST_CAP == CAP_CHECKPOINT_RESTORE, "CAP_LAST_CAP is not CAP_CHECKPOINT_RESTORE");
+#else
 static_assert(CAP_LAST_CAP == CAP_AUDIT_READ, "CAP_LAST_CAP is not CAP_AUDIT_READ");
+#endif
 
 static bool ComputeCapAmbientSupported() {
+#if defined(__ANDROID__)
     return prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_CHOWN, 0, 0) >= 0;
+#else
+    return true;
+#endif
 }
 
 static unsigned int ComputeLastValidCap() {
+#if defined(__ANDROID__)
     // Android does not support kernels < 3.8. 'CAP_WAKE_ALARM' has been present since 3.0, see
     // http://lxr.free-electrons.com/source/include/linux/capability.h?v=3.0#L360.
     unsigned int last_valid_cap = CAP_WAKE_ALARM;
@@ -80,6 +96,9 @@ static unsigned int ComputeLastValidCap() {
 
     // |last_valid_cap| will be the first failing value.
     return last_valid_cap - 1;
+#else
+    return CAP_LAST_CAP;
+#endif
 }
 
 static bool DropBoundingSet(const CapSet& to_keep) {
@@ -104,17 +123,15 @@ static bool DropBoundingSet(const CapSet& to_keep) {
 }
 
 static bool SetProcCaps(const CapSet& to_keep, bool add_setpcap) {
-    cap_t caps = cap_init();
-    auto deleter = [](cap_t* p) { cap_free(*p); };
-    std::unique_ptr<cap_t, decltype(deleter)> ptr_caps(&caps, deleter);
+    ScopedCaps caps(cap_init());
 
-    cap_clear(caps);
+    cap_clear(caps.get());
     cap_value_t value[1];
     for (size_t cap = 0; cap < to_keep.size(); ++cap) {
         if (to_keep.test(cap)) {
             value[0] = cap;
-            if (cap_set_flag(caps, CAP_INHERITABLE, arraysize(value), value, CAP_SET) != 0 ||
-                cap_set_flag(caps, CAP_PERMITTED, arraysize(value), value, CAP_SET) != 0) {
+            if (cap_set_flag(caps.get(), CAP_INHERITABLE, arraysize(value), value, CAP_SET) != 0 ||
+                cap_set_flag(caps.get(), CAP_PERMITTED, arraysize(value), value, CAP_SET) != 0) {
                 PLOG(ERROR) << "cap_set_flag(INHERITABLE|PERMITTED, " << cap << ") failed";
                 return false;
             }
@@ -123,14 +140,14 @@ static bool SetProcCaps(const CapSet& to_keep, bool add_setpcap) {
 
     if (add_setpcap) {
         value[0] = CAP_SETPCAP;
-        if (cap_set_flag(caps, CAP_PERMITTED, arraysize(value), value, CAP_SET) != 0 ||
-            cap_set_flag(caps, CAP_EFFECTIVE, arraysize(value), value, CAP_SET) != 0) {
+        if (cap_set_flag(caps.get(), CAP_PERMITTED, arraysize(value), value, CAP_SET) != 0 ||
+            cap_set_flag(caps.get(), CAP_EFFECTIVE, arraysize(value), value, CAP_SET) != 0) {
             PLOG(ERROR) << "cap_set_flag(PERMITTED|EFFECTIVE, " << CAP_SETPCAP << ") failed";
             return false;
         }
     }
 
-    if (cap_set_proc(caps) != 0) {
+    if (cap_set_proc(caps.get()) != 0) {
         PLOG(ERROR) << "cap_set_proc(" << to_keep.to_ulong() << ") failed";
         return false;
     }
@@ -138,6 +155,7 @@ static bool SetProcCaps(const CapSet& to_keep, bool add_setpcap) {
 }
 
 static bool SetAmbientCaps(const CapSet& to_raise) {
+#if defined(__ANDROID__)
     for (size_t cap = 0; cap < to_raise.size(); ++cap) {
         if (to_raise.test(cap)) {
             if (prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, cap, 0, 0) != 0) {
@@ -146,6 +164,7 @@ static bool SetAmbientCaps(const CapSet& to_raise) {
             }
         }
     }
+#endif
     return true;
 }
 
@@ -192,3 +211,19 @@ bool SetCapsForExec(const CapSet& to_keep) {
     // See http://man7.org/linux/man-pages/man7/capabilities.7.html.
     return SetAmbientCaps(to_keep);
 }
+
+bool DropInheritableCaps() {
+    ScopedCaps caps(cap_get_proc());
+    if (cap_clear_flag(caps.get(), CAP_INHERITABLE) == -1) {
+        PLOG(ERROR) << "cap_clear_flag(INHERITABLE) failed";
+        return false;
+    }
+    if (cap_set_proc(caps.get()) != 0) {
+        PLOG(ERROR) << "cap_set_proc() failed";
+        return false;
+    }
+    return true;
+}
+
+}  // namespace init
+}  // namespace android

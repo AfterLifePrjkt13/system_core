@@ -21,6 +21,7 @@
 
 #include <utility>
 
+#include <android-base/cmsg.h>
 #include <android-base/unique_fd.h>
 #include <async_safe/log.h>
 #include <cutils/sockets.h>
@@ -28,10 +29,16 @@
 #include "protocol.h"
 #include "util.h"
 
+using android::base::ReceiveFileDescriptors;
 using android::base::unique_fd;
 
-bool tombstoned_connect(pid_t pid, unique_fd* tombstoned_socket, unique_fd* output_fd,
+bool tombstoned_connect(pid_t pid, unique_fd* tombstoned_socket, unique_fd* text_output_fd,
                         DebuggerdDumpType dump_type) {
+  return tombstoned_connect(pid, tombstoned_socket, text_output_fd, nullptr, dump_type);
+}
+
+bool tombstoned_connect(pid_t pid, unique_fd* tombstoned_socket, unique_fd* text_output_fd,
+                        unique_fd* proto_output_fd, DebuggerdDumpType dump_type) {
   unique_fd sockfd(
       socket_local_client((dump_type != kDebuggerdJavaBacktrace ? kTombstonedCrashSocketName
                                                                 : kTombstonedJavaTraceSocketName),
@@ -52,8 +59,15 @@ bool tombstoned_connect(pid_t pid, unique_fd* tombstoned_socket, unique_fd* outp
     return false;
   }
 
-  unique_fd tmp_output_fd;
-  ssize_t rc = recv_fd(sockfd, &packet, sizeof(packet), &tmp_output_fd);
+  unique_fd tmp_output_fd, tmp_proto_fd;
+  ssize_t rc = -1;
+
+  if (dump_type == kDebuggerdTombstoneProto) {
+    rc = ReceiveFileDescriptors(sockfd, &packet, sizeof(packet), &tmp_output_fd, &tmp_proto_fd);
+  } else {
+    rc = ReceiveFileDescriptors(sockfd, &packet, sizeof(packet), &tmp_output_fd);
+  }
+
   if (rc == -1) {
     async_safe_format_log(ANDROID_LOG_ERROR, "libc",
                           "failed to read response to DumpRequest packet: %s", strerror(errno));
@@ -76,7 +90,10 @@ bool tombstoned_connect(pid_t pid, unique_fd* tombstoned_socket, unique_fd* outp
   }
 
   *tombstoned_socket = std::move(sockfd);
-  *output_fd = std::move(tmp_output_fd);
+  *text_output_fd = std::move(tmp_output_fd);
+  if (proto_output_fd) {
+    *proto_output_fd = std::move(tmp_proto_fd);
+  }
   return true;
 }
 

@@ -14,6 +14,10 @@
 // limitations under the License.
 //
 
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
 bootstat_lib_src_files = [
     "boot_event_record_store.cpp",
 ]
@@ -30,11 +34,8 @@ cc_defaults {
         "libbase",
         "libcutils",
         "liblog",
-        "libmetricslogger",
     ],
-    whole_static_libs: ["libgtest_prod"],
-    // Clang is required because of C++14
-    clang: true,
+    header_libs: ["libgtest_prod_headers"],
 }
 
 // bootstat static library
@@ -66,7 +67,18 @@ cc_binary {
     name: "bootstat",
     defaults: ["bootstat_defaults"],
     static_libs: ["libbootstat"],
+    shared_libs: [
+        "libstatslog"
+    ],
     init_rc: ["bootstat.rc"],
+    product_variables: {
+        pdk: {
+            enabled: false,
+        },
+        debuggable: {
+            init_rc: ["bootstat-debug.rc"],
+        },
+    },
     srcs: ["bootstat.cpp"],
 }
 
@@ -85,4 +97,7 @@ cc_test {
         "boot_event_record_store_test.cpp",
         "testrunner.cpp",
     ],
+    test_options: {
+        unit_test: true,
+    },
 }

@@ -20,6 +20,7 @@
 #include <string.h>
 
 #include <limits>
+#include <string_view>
 #include <thread>
 
 #include <android-base/file.h>
@@ -27,15 +28,16 @@
 #include <android-base/parseint.h>
 #include <android-base/unique_fd.h>
 #include <debuggerd/client.h>
-#include <selinux/selinux.h>
+#include <procinfo/process.h>
 #include "util.h"
 
 using android::base::unique_fd;
 
 static void usage(int exit_code) {
-  fprintf(stderr, "usage: debuggerd [-b] PID\n");
+  fprintf(stderr, "usage: debuggerd [-bj] PID\n");
   fprintf(stderr, "\n");
   fprintf(stderr, "-b, --backtrace    just a backtrace rather than a full tombstone\n");
+  fprintf(stderr, "-j                 collect java traces\n");
   _exit(exit_code);
 }
 
@@ -58,12 +60,51 @@ static std::thread spawn_redirect_thread(unique_fd fd) {
 int main(int argc, char* argv[]) {
   if (argc <= 1) usage(0);
   if (argc > 3) usage(1);
-  if (argc == 3 && strcmp(argv[1], "-b") != 0 && strcmp(argv[1], "--backtrace") != 0) usage(1);
-  bool backtrace_only = argc == 3;
+
+  DebuggerdDumpType dump_type = kDebuggerdTombstone;
+
+  if (argc == 3) {
+    std::string_view flag = argv[1];
+    if (flag == "-b" || flag == "--backtrace") {
+      dump_type = kDebuggerdNativeBacktrace;
+    } else if (flag == "-j") {
+      dump_type = kDebuggerdJavaBacktrace;
+    } else {
+      usage(1);
+    }
+  }
 
   pid_t pid;
   if (!android::base::ParseInt(argv[argc - 1], &pid, 1, std::numeric_limits<pid_t>::max())) {
     usage(1);
+  }
+
+  if (getuid() != 0) {
+    errx(1, "root is required");
+  }
+
+  // Check to see if the process exists and that we can actually send a signal to it.
+  android::procinfo::ProcessInfo proc_info;
+  if (!android::procinfo::GetProcessInfo(pid, &proc_info)) {
+    err(1, "failed to fetch info for process %d", pid);
+  }
+
+  if (proc_info.state == android::procinfo::kProcessStateZombie) {
+    errx(1, "process %d is a zombie", pid);
+  }
+
+  // Send a signal to the main thread pid, not a side thread. The signal
+  // handler always sets the crashing tid to the main thread pid when sent this
+  // signal. This is to avoid a problem where the signal is sent to a process,
+  // but happens on a side thread and the intercept mismatches since it
+  // is looking for the main thread pid, not the tid of this random thread.
+  // See b/194346289 for extra details.
+  if (kill(proc_info.pid, 0) != 0) {
+    if (pid == proc_info.pid) {
+      err(1, "cannot send signal to process %d", pid);
+    } else {
+      err(1, "cannot send signal to main thread %d (requested thread %d)", proc_info.pid, pid);
+    }
   }
 
   unique_fd piperead, pipewrite;
@@ -72,10 +113,13 @@ int main(int argc, char* argv[]) {
   }
 
   std::thread redirect_thread = spawn_redirect_thread(std::move(piperead));
-  if (!debuggerd_trigger_dump(pid, backtrace_only ? kDebuggerdNativeBacktrace : kDebuggerdTombstone,
-                              0, std::move(pipewrite))) {
+  if (!debuggerd_trigger_dump(proc_info.pid, dump_type, 0, std::move(pipewrite))) {
     redirect_thread.join();
-    errx(1, "failed to dump process %d", pid);
+    if (pid == proc_info.pid) {
+      errx(1, "failed to dump process %d", pid);
+    } else {
+      errx(1, "failed to dump main thread %d (requested thread %d)", proc_info.pid, pid);
+    }
   }
 
   redirect_thread.join();

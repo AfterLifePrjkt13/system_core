@@ -1,44 +1,79 @@
-common_cflags = [
-    "-Werror",
-    "-Wno-unused-parameter",
-    "-Wno-unused-const-variable",
-    "-include bsd-compatibility.h"
-]
-
-cc_library_static {
-    srcs: [
-        "upstream-netbsd/bin/dd/args.c",
-        "upstream-netbsd/bin/dd/conv.c",
-        "upstream-netbsd/bin/dd/dd.c",
-        "upstream-netbsd/bin/dd/dd_hostops.c",
-        "upstream-netbsd/bin/dd/misc.c",
-        "upstream-netbsd/bin/dd/position.c",
-        "upstream-netbsd/lib/libc/gen/getbsize.c",
-        "upstream-netbsd/lib/libc/gen/humanize_number.c",
-        "upstream-netbsd/lib/libc/stdlib/strsuftoll.c",
-        "upstream-netbsd/lib/libc/string/swab.c",
-        "upstream-netbsd/lib/libutil/raise_default_signal.c",
-    ],
-    cflags: common_cflags + [
-        "-Dmain=dd_main",
-        "-DNO_CONV",
-    ],
-    local_include_dirs: ["upstream-netbsd/include/"],
-    name: "libtoolbox_dd",
+package {
+    default_applicable_licenses: ["system_core_toolbox_license"],
 }
 
-// We build BSD grep separately, so it can provide egrep and fgrep too.
-cc_binary {
-    name: "grep",
-    srcs: [
-        "upstream-netbsd/usr.bin/grep/fastgrep.c",
-        "upstream-netbsd/usr.bin/grep/file.c",
-        "upstream-netbsd/usr.bin/grep/grep.c",
-        "upstream-netbsd/usr.bin/grep/queue.c",
-        "upstream-netbsd/usr.bin/grep/util.c",
+// Added automatically by a large-scale-change
+// See: http://go/android-license-faq
+license {
+    name: "system_core_toolbox_license",
+    visibility: [":__subpackages__"],
+    license_kinds: [
+        "SPDX-license-identifier-Apache-2.0",
     ],
-    cflags: common_cflags,
-    local_include_dirs: ["upstream-netbsd/include/"],
-    symlinks: ["egrep", "fgrep"],
+    license_text: [
+        "NOTICE",
+    ],
+}
 
+cc_defaults {
+    name: "toolbox_defaults",
+    cflags: [
+        "-Werror",
+        "-Wno-unused-parameter",
+        "-Wno-unused-const-variable",
+        "-D_FILE_OFFSET_BITS=64",
+    ],
+}
+
+genrule {
+    name: "toolbox_input_labels",
+    tool_files: ["generate-input.h-labels.py"],
+    cmd: "$(location) $(in) >$(out)",
+    srcs: [":kernel_input_headers"],
+    out: ["input.h-labels.h"],
+}
+
+cc_defaults {
+    name: "toolbox_binary_defaults",
+    defaults: ["toolbox_defaults"],
+    srcs: [
+        "toolbox.c",
+        "getevent.c",
+        "getprop.cpp",
+        "modprobe.cpp",
+        "setprop.cpp",
+        "start.cpp",
+    ],
+    generated_headers: [
+        "toolbox_input_labels",
+    ],
+    shared_libs: [
+        "libbase",
+    ],
+    static_libs: [
+        "libmodprobe",
+        "libpropertyinfoparser",
+    ],
+
+    symlinks: [
+        "getevent",
+        "getprop",
+        "modprobe",
+        "setprop",
+        "start",
+        "stop",
+    ],
+}
+
+cc_binary {
+    name: "toolbox",
+    defaults: ["toolbox_binary_defaults"],
+    recovery_available: true,
+}
+
+cc_binary {
+    name: "toolbox_vendor",
+    stem: "toolbox",
+    vendor: true,
+    defaults: ["toolbox_binary_defaults"],
 }

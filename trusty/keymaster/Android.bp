@@ -14,55 +14,170 @@
 // limitations under the License.
 //
 
-// WARNING: Everything listed here will be built on ALL platforms,
-// including x86, the emulator, and the SDK.  Modules must be uniquely
-// named (liblights.panda), and must build everywhere, or limit themselves
-// to only building on ARM if they include assembly. Individual makefiles
-// are responsible for having their own logic, for fine-grained control.
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
 
-// trusty_keymaster is a binary used only for on-device testing.  It
-// runs Trusty Keymaster through a basic set of operations with RSA
-// and ECDSA keys.
 cc_binary {
-    name: "trusty_keymaster_tipc",
+    name: "android.hardware.keymaster@3.0-service.trusty",
+    defaults: ["hidl_defaults"],
+    relative_install_path: "hw",
+    vendor: true,
+    init_rc: ["3.0/android.hardware.keymaster@3.0-service.trusty.rc"],
     srcs: [
-        "trusty_keymaster_device.cpp",
-        "trusty_keymaster_ipc.cpp",
-        "trusty_keymaster_main.cpp",
+        "3.0/service.cpp",
+        "3.0/TrustyKeymaster3Device.cpp",
+        "ipc/trusty_keymaster_ipc.cpp",
+        "TrustyKeymaster.cpp",
     ],
+
+    local_include_dirs: ["include"],
+
     shared_libs: [
-        "libcrypto",
+        "liblog",
         "libcutils",
-        "libkeymaster_portable",
-        "libkeymaster_staging",
+        "libdl",
+        "libbase",
+        "libutils",
+        "libhardware",
+        "libhidlbase",
         "libtrusty",
         "libkeymaster_messages",
-        "libsoftkeymasterdevice",
-        "liblog",
+        "libkeymaster3device",
+        "android.hardware.keymaster@3.0"
     ],
 }
 
-// keystore.trusty is the HAL used by keystore on Trusty devices.
-cc_library_shared {
-    name: "keystore.trusty",
+cc_binary {
+    name: "android.hardware.keymaster@4.0-service.trusty",
+    defaults: ["hidl_defaults"],
     relative_install_path: "hw",
+    vendor: true,
+    init_rc: ["4.0/android.hardware.keymaster@4.0-service.trusty.rc"],
     srcs: [
-        "module.cpp",
-        "trusty_keymaster_ipc.cpp",
-        "trusty_keymaster_device.cpp",
+        "4.0/service.cpp",
+        "4.0/TrustyKeymaster4Device.cpp",
+        "ipc/trusty_keymaster_ipc.cpp",
+        "TrustyKeymaster.cpp",
     ],
 
+    local_include_dirs: ["include"],
+
+    shared_libs: [
+        "liblog",
+        "libcutils",
+        "libdl",
+        "libbase",
+        "libutils",
+        "libhardware",
+        "libhidlbase",
+        "libtrusty",
+        "libkeymaster_messages",
+        "libkeymaster4",
+        "android.hardware.keymaster@4.0"
+    ],
+
+    vintf_fragments: ["4.0/android.hardware.keymaster@4.0-service.trusty.xml"],
+}
+
+cc_binary {
+    name: "android.hardware.security.keymint-service.trusty",
+    relative_install_path: "hw",
+    init_rc: ["keymint/android.hardware.security.keymint-service.trusty.rc"],
+    vintf_fragments: [
+        "keymint/android.hardware.security.keymint-service.trusty.xml",
+    ],
+    vendor: true,
     cflags: [
-        "-fvisibility=hidden",
+        "-Wall",
+        "-Wextra",
+    ],
+    local_include_dirs: [
+        "include",
+    ],
+    srcs: [
+        "TrustyKeymaster.cpp",
+        "ipc/trusty_keymaster_ipc.cpp",
+        "keymint/TrustyKeyMintDevice.cpp",
+        "keymint/TrustyKeyMintOperation.cpp",
+        "keymint/TrustyRemotelyProvisionedComponentDevice.cpp",
+        "keymint/TrustySecureClock.cpp",
+        "keymint/TrustySharedSecret.cpp",
+        "keymint/service.cpp",
+    ],
+    defaults: [
+        "keymint_use_latest_hal_aidl_ndk_shared",
+    ],
+    shared_libs: [
+        "android.hardware.security.secureclock-V1-ndk",
+        "android.hardware.security.sharedsecret-V1-ndk",
+        "lib_android_keymaster_keymint_utils",
+        "libbase",
+        "libbinder_ndk",
+        "libhardware",
+        "libkeymaster_messages",
+        "libkeymint",
+        "liblog",
+        "libtrusty",
+        "libutils",
+    ],
+    required: [
+        "android.hardware.hardware_keystore.xml",
+        "RemoteProvisioner",
+    ],
+}
+
+prebuilt_etc {
+    name: "keymaster_soft_attestation_keys.xml",
+    vendor: true,
+    src: "set_attestation_key/keymaster_soft_attestation_keys.xml",
+}
+
+cc_library {
+    name: "libtrusty_ipc",
+    vendor: true,
+    srcs: ["ipc/trusty_keymaster_ipc.cpp"],
+    local_include_dirs: ["include"],
+    shared_libs: [
+        "libc",
+        "libcrypto",
+        "liblog",
+        "libtrusty",
+        "libhardware",
+        "libkeymaster_messages",
+        "libutils",
+        "libxml2",
+    ],
+    export_include_dirs: ["include"],
+    cflags: [
         "-Wall",
         "-Werror",
     ],
+}
+
+cc_binary {
+    name: "trusty_keymaster_set_attestation_key",
+    vendor: true,
+
+    srcs: [
+        "set_attestation_key/set_attestation_key.cpp",
+        "ipc/trusty_keymaster_ipc.cpp",
+    ],
+
+    local_include_dirs: ["include"],
 
     shared_libs: [
+        "libc",
         "libcrypto",
-        "libkeymaster_messages",
-        "libtrusty",
         "liblog",
-        "libcutils",
+        "libtrusty",
+        "libhardware",
+        "libkeymaster_messages",
+        "libutils",
+        "libxml2",
+    ],
+    cflags: [
+        "-Wall",
+        "-Werror",
     ],
 }

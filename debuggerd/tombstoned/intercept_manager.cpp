@@ -24,13 +24,15 @@
 #include <event2/event.h>
 #include <event2/listener.h>
 
+#include <android-base/cmsg.h>
 #include <android-base/logging.h>
+#include <android-base/properties.h>
 #include <android-base/unique_fd.h>
-#include <cutils/sockets.h>
 
 #include "protocol.h"
 #include "util.h"
 
+using android::base::ReceiveFileDescriptors;
 using android::base::unique_fd;
 
 static void intercept_close_cb(evutil_socket_t sockfd, short event, void* arg) {
@@ -96,7 +98,8 @@ static void intercept_request_cb(evutil_socket_t sockfd, short ev, void* arg) {
   {
     unique_fd rcv_fd;
     InterceptRequest intercept_request;
-    ssize_t result = recv_fd(sockfd, &intercept_request, sizeof(intercept_request), &rcv_fd);
+    ssize_t result =
+        ReceiveFileDescriptors(sockfd, &intercept_request, sizeof(intercept_request), &rcv_fd);
 
     if (result == -1) {
       PLOG(WARNING) << "failed to read from intercept socket";
@@ -160,7 +163,7 @@ static void intercept_request_cb(evutil_socket_t sockfd, short ev, void* arg) {
     event_assign(intercept->intercept_event, intercept_manager->base, sockfd, EV_READ | EV_TIMEOUT,
                  intercept_close_cb, arg);
 
-    struct timeval timeout = { .tv_sec = 10, .tv_usec = 0 };
+    struct timeval timeout = {.tv_sec = 10 * android::base::HwTimeoutMultiplier(), .tv_usec = 0};
     event_add(intercept->intercept_event, &timeout);
   }
 
@@ -176,7 +179,7 @@ static void intercept_accept_cb(evconnlistener* listener, evutil_socket_t sockfd
   intercept->intercept_manager = static_cast<InterceptManager*>(arg);
   intercept->sockfd.reset(sockfd);
 
-  struct timeval timeout = { 1, 0 };
+  struct timeval timeout = {1 * android::base::HwTimeoutMultiplier(), 0};
   event_base* base = evconnlistener_get_base(listener);
   event* intercept_event =
     event_new(base, sockfd, EV_TIMEOUT | EV_READ, intercept_request_cb, intercept);
@@ -185,8 +188,20 @@ static void intercept_accept_cb(evconnlistener* listener, evutil_socket_t sockfd
 }
 
 InterceptManager::InterceptManager(event_base* base, int intercept_socket) : base(base) {
-  this->listener = evconnlistener_new(base, intercept_accept_cb, this, -1, LEV_OPT_CLOSE_ON_FREE,
-                                      intercept_socket);
+  this->listener = evconnlistener_new(base, intercept_accept_cb, this, LEV_OPT_CLOSE_ON_FREE,
+                                      /* backlog */ -1, intercept_socket);
+}
+
+bool dump_types_compatible(DebuggerdDumpType interceptor, DebuggerdDumpType dump) {
+  if (interceptor == dump) {
+    return true;
+  }
+
+  if (interceptor == kDebuggerdTombstone && dump == kDebuggerdTombstoneProto) {
+    return true;
+  }
+
+  return false;
 }
 
 bool InterceptManager::GetIntercept(pid_t pid, DebuggerdDumpType dump_type,
@@ -199,7 +214,7 @@ bool InterceptManager::GetIntercept(pid_t pid, DebuggerdDumpType dump_type,
   if (dump_type == kDebuggerdAnyIntercept) {
     LOG(INFO) << "found registered intercept of type " << it->second->dump_type
               << " for requested type kDebuggerdAnyIntercept";
-  } else if (it->second->dump_type != dump_type) {
+  } else if (!dump_types_compatible(it->second->dump_type, dump_type)) {
     LOG(WARNING) << "found non-matching intercept of type " << it->second->dump_type
                  << " for requested type: " << dump_type;
     return false;

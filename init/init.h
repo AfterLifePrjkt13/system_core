@@ -14,29 +14,37 @@
  * limitations under the License.
  */
 
-#ifndef _INIT_INIT_H
-#define _INIT_INIT_H
+#pragma once
+
+#include <sys/types.h>
 
 #include <string>
 
-// Note: These globals are *only* valid in init, so they should not be used in ueventd,
-// watchdogd, or any files that may be included in those, such as devices.cpp and util.cpp.
-// TODO: Have an Init class and remove all globals.
-extern const char *ENV[32];
-extern std::string default_console;
-extern struct selabel_handle *sehandle;
-extern struct selabel_handle *sehandle_prop;
+#include "action.h"
+#include "action_manager.h"
+#include "parser.h"
+#include "service_list.h"
 
-void handle_control_message(const std::string& msg, const std::string& arg);
+namespace android {
+namespace init {
 
-void property_changed(const std::string& name, const std::string& value);
-
-void register_epoll_handler(int fd, void (*fn)());
-
-int add_environment(const char* key, const char* val);
+Parser CreateParser(ActionManager& action_manager, ServiceList& service_list);
+Parser CreateServiceOnlyParser(ServiceList& service_list, bool from_apex);
 
 bool start_waiting_for_property(const char *name, const char *value);
 
 void DumpState();
 
-#endif  /* _INIT_INIT_H */
+void ResetWaitForProp();
+
+void SendLoadPersistentPropertiesMessage();
+
+void PropertyChanged(const std::string& name, const std::string& value);
+bool QueueControlMessage(const std::string& message, const std::string& name, pid_t pid, int fd);
+
+void DebugRebootLogging();
+
+int SecondStageMain(int argc, char** argv);
+
+}  // namespace init
+}  // namespace android

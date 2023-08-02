@@ -32,13 +32,18 @@
 #include <mutex>
 #include <thread>
 
+#include <android-base/chrono_utils.h>
 #include <android-base/file.h>
 #include <android-base/logging.h>
 #include <android-base/properties.h>
 #include <android-base/stringprintf.h>
 
 using android::base::StringPrintf;
+using android::base::boot_clock;
 using namespace std::chrono_literals;
+
+namespace android {
+namespace init {
 
 static std::thread* g_bootcharting_thread;
 
@@ -47,9 +52,9 @@ static std::condition_variable g_bootcharting_finished_cv;
 static bool g_bootcharting_finished;
 
 static long long get_uptime_jiffies() {
-  std::string uptime;
-  if (!android::base::ReadFileToString("/proc/uptime", &uptime)) return 0;
-  return 100LL * strtod(uptime.c_str(), NULL);
+    constexpr int64_t kNanosecondsPerJiffy = 10000000;
+    boot_clock::time_point uptime = boot_clock::now();
+    return uptime.time_since_epoch().count() / kNanosecondsPerJiffy;
 }
 
 static std::unique_ptr<FILE, decltype(&fclose)> fopen_unique(const char* filename,
@@ -135,6 +140,20 @@ static void log_processes(FILE* log) {
 static void bootchart_thread_main() {
   LOG(INFO) << "Bootcharting started";
 
+  // Unshare the mount namespace of this thread so that the init process itself can switch
+  // the mount namespace later while this thread is still running.
+  // Otherwise, setns() call invoked as part of `enter_default_mount_ns` fails with EINVAL.
+  //
+  // Note that after unshare()'ing the mount namespace from the main thread, this thread won't
+  // receive mount/unmount events from the other mount namespace unless the events are happening
+  // from under a sharable mount.
+  //
+  // The bootchart thread is safe to unshare the mount namespace because it only reads from /proc
+  // and write to /data which are not private mounts.
+  if (unshare(CLONE_NEWNS) == -1) {
+      PLOG(ERROR) << "Cannot create mount namespace";
+      return;
+  }
   // Open log files.
   auto stat_log = fopen_unique("/data/bootchart/proc_stat.log", "we");
   if (!stat_log) return;
@@ -160,35 +179,38 @@ static void bootchart_thread_main() {
   LOG(INFO) << "Bootcharting finished";
 }
 
-static int do_bootchart_start() {
-  // We don't care about the content, but we do care that /data/bootchart/enabled actually exists.
-  std::string start;
-  if (!android::base::ReadFileToString("/data/bootchart/enabled", &start)) {
-    LOG(VERBOSE) << "Not bootcharting";
-    return 0;
-  }
+static Result<void> do_bootchart_start() {
+    // We don't care about the content, but we do care that /data/bootchart/enabled actually exists.
+    std::string start;
+    if (!android::base::ReadFileToString("/data/bootchart/enabled", &start)) {
+        LOG(VERBOSE) << "Not bootcharting";
+        return {};
+    }
 
-  g_bootcharting_thread = new std::thread(bootchart_thread_main);
-  return 0;
+    g_bootcharting_thread = new std::thread(bootchart_thread_main);
+    return {};
 }
 
-static int do_bootchart_stop() {
-  if (!g_bootcharting_thread) return 0;
+static Result<void> do_bootchart_stop() {
+    if (!g_bootcharting_thread) return {};
 
-  // Tell the worker thread it's time to quit.
-  {
-    std::lock_guard<std::mutex> lock(g_bootcharting_finished_mutex);
-    g_bootcharting_finished = true;
-    g_bootcharting_finished_cv.notify_one();
-  }
+    // Tell the worker thread it's time to quit.
+    {
+        std::lock_guard<std::mutex> lock(g_bootcharting_finished_mutex);
+        g_bootcharting_finished = true;
+        g_bootcharting_finished_cv.notify_one();
+    }
 
-  g_bootcharting_thread->join();
-  delete g_bootcharting_thread;
-  g_bootcharting_thread = nullptr;
-  return 0;
+    g_bootcharting_thread->join();
+    delete g_bootcharting_thread;
+    g_bootcharting_thread = nullptr;
+    return {};
 }
 
-int do_bootchart(const std::vector<std::string>& args) {
-  if (args[1] == "start") return do_bootchart_start();
-  return do_bootchart_stop();
+Result<void> do_bootchart(const BuiltinArguments& args) {
+    if (args[1] == "start") return do_bootchart_start();
+    return do_bootchart_stop();
 }
+
+}  // namespace init
+}  // namespace android

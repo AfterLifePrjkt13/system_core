@@ -14,8 +14,7 @@
  * limitations under the License.
  */
 
-#ifndef TRANSPORT_H_
-#define TRANSPORT_H_
+#pragma once
 
 #include <android-base/macros.h>
 
@@ -37,6 +36,8 @@ class Transport {
     // Closes the underlying transport. Returns 0 on success.
     virtual int Close() = 0;
 
+    virtual int Reset() = 0;
+
     // Blocks until the transport disconnects. Transports that don't support
     // this will return immediately. Returns 0 on success.
     virtual int WaitForDisconnect() { return 0; }
@@ -44,5 +45,3 @@ class Transport {
   private:
     DISALLOW_COPY_AND_ASSIGN(Transport);
 };
-
-#endif  // TRANSPORT_H_

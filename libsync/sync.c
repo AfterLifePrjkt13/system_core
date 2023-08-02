@@ -30,6 +30,29 @@
 
 #include <android/sync.h>
 
+/* Prototypes for deprecated functions that used to be declared in the legacy
+ * android/sync.h. They've been moved here to make sure new code does not use
+ * them, but the functions are still defined to avoid breaking existing
+ * binaries. Eventually they can be removed altogether.
+ */
+struct sync_fence_info_data {
+    uint32_t len;
+    char name[32];
+    int32_t status;
+    uint8_t pt_info[0];
+};
+struct sync_pt_info {
+    uint32_t len;
+    char obj_name[32];
+    char driver_name[32];
+    int32_t status;
+    uint64_t timestamp_ns;
+    uint8_t driver_data[0];
+};
+struct sync_fence_info_data* sync_fence_info(int fd);
+struct sync_pt_info* sync_pt_info(struct sync_fence_info_data* info, struct sync_pt_info* itr);
+void sync_fence_info_free(struct sync_fence_info_data* info);
+
 /* Legacy Sync API */
 
 struct sync_legacy_merge_data {
@@ -217,6 +240,8 @@ static struct sync_file_info *modern_sync_file_info(int fd)
                   local_info.num_fences * sizeof(struct sync_fence_info));
     if (!info)
         return NULL;
+
+    info->num_fences = local_info.num_fences;
     info->sync_fence_info = (__u64)(uintptr_t)(info + 1);
 
     err = ioctl(fd, SYNC_IOC_FILE_INFO, info);
@@ -275,7 +300,6 @@ static struct sync_file_info* legacy_fence_info_to_sync_file_info(
     info = calloc(1, sizeof(struct sync_file_info) +
                      num_fences * sizeof(struct sync_fence_info));
     if (!info) {
-        free(legacy_info);
         return NULL;
     }
     info->sync_fence_info = (__u64)(uintptr_t)(info + 1);

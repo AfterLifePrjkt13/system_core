@@ -19,11 +19,19 @@
 
 #include <unistd.h>
 
+#if !defined(__MINGW32__)
+#include <sys/mman.h>
+#endif
+
 #if defined(__APPLE__)
 
 /* Mac OS has always had a 64-bit off_t, so it doesn't have off64_t. */
-
+static_assert(sizeof(off_t) >= 8, "This code requires that Mac OS have at least a 64-bit off_t.");
 typedef off_t off64_t;
+
+static inline void* mmap64(void* addr, size_t length, int prot, int flags, int fd, off64_t offset) {
+    return mmap(addr, length, prot, flags, fd, offset);
+}
 
 static inline off64_t lseek64(int fd, off64_t offset, int whence) {
     return lseek(fd, offset, whence);
@@ -63,19 +71,17 @@ static inline int ftruncate64(int fd, off64_t length) {
 #define CONSTEXPR
 #endif
 
-/*
- * TEMP_FAILURE_RETRY is defined by some, but not all, versions of
- * <unistd.h>. (Alas, it is not as standard as we'd hoped!) So, if it's
- * not already defined, then define it here.
- */
+/* TEMP_FAILURE_RETRY is not available on macOS, but still useful there. */
 #ifndef TEMP_FAILURE_RETRY
 /* Used to retry syscalls that can return EINTR. */
-#define TEMP_FAILURE_RETRY(exp) ({         \
-    typeof (exp) _rc;                      \
-    do {                                   \
-        _rc = (exp);                       \
-    } while (_rc == -1 && errno == EINTR); \
-    _rc; })
+#define TEMP_FAILURE_RETRY(exp)                \
+    ({                                         \
+        __typeof__(exp) _rc;                   \
+        do {                                   \
+            _rc = (exp);                       \
+        } while (_rc == -1 && errno == EINTR); \
+        _rc;                                   \
+    })
 #endif
 
 #if defined(_WIN32)

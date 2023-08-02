@@ -39,6 +39,8 @@
 #include "debuggerd/handler.h"
 #endif
 
+extern "C" void android_set_abort_message(const char* msg);
+
 #if defined(__arm__)
 // See https://www.kernel.org/doc/Documentation/arm/kernel_user_helpers.txt for details.
 #define __kuser_helper_version (*(int32_t*) 0xffff0ffc)
@@ -114,6 +116,11 @@ noinline int do_action_on_thread(const char* arg) {
     return reinterpret_cast<uintptr_t>(result);
 }
 
+noinline int crash_null() {
+  int (*null_func)() = nullptr;
+  return null_func();
+}
+
 noinline int crash3(int a) {
     *reinterpret_cast<int*>(0xdead) = a;
     return a*4;
@@ -129,9 +136,21 @@ noinline int crash(int a) {
     return a*2;
 }
 
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wfree-nonheap-object"
+
 noinline void abuse_heap() {
     char buf[16];
     free(buf); // GCC is smart enough to warn about this, but we're doing it deliberately.
+}
+#pragma clang diagnostic pop
+
+noinline void leak() {
+    while (true) {
+        void* mapping =
+            mmap(nullptr, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        static_cast<volatile char*>(mapping)[0] = 'a';
+    }
 }
 
 noinline void sigsegv_non_null() {
@@ -160,15 +179,20 @@ static int usage() {
     fprintf(stderr, "  stack-overflow        recurse until the stack overflows\n");
     fprintf(stderr, "  nostack               crash with a NULL stack pointer\n");
     fprintf(stderr, "\n");
-    fprintf(stderr, "  heap-corruption       cause a libc abort by corrupting the heap\n");
     fprintf(stderr, "  heap-usage            cause a libc abort by abusing a heap function\n");
+    fprintf(stderr, "  call-null             cause a crash by calling through a nullptr\n");
+    fprintf(stderr, "  leak                  leak memory until we get OOM-killed\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "  abort                 call abort()\n");
+    fprintf(stderr, "  abort_with_msg        call abort() setting an abort message\n");
+    fprintf(stderr, "  abort_with_null_msg   call abort() setting a null abort message\n");
     fprintf(stderr, "  assert                call assert() without a function\n");
     fprintf(stderr, "  assert2               call assert() with a function\n");
     fprintf(stderr, "  exit                  call exit(1)\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "  fortify               fail a _FORTIFY_SOURCE check\n");
+    fprintf(stderr, "  fdsan_file            close a file descriptor that's owned by a FILE*\n");
+    fprintf(stderr, "  fdsan_dir             close a file descriptor that's owned by a DIR*\n");
     fprintf(stderr, "  seccomp               fail a seccomp check\n");
 #if defined(__arm__)
     fprintf(stderr, "  kuser_helper_version  call kuser_helper_version\n");
@@ -177,12 +201,14 @@ static int usage() {
     fprintf(stderr, "  kuser_memory_barrier  call kuser_memory_barrier\n");
     fprintf(stderr, "  kuser_cmpxchg64       call kuser_cmpxchg64\n");
 #endif
+    fprintf(stderr, "  xom                   read execute-only memory\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "  LOG_ALWAYS_FATAL      call liblog LOG_ALWAYS_FATAL\n");
     fprintf(stderr, "  LOG_ALWAYS_FATAL_IF   call liblog LOG_ALWAYS_FATAL_IF\n");
     fprintf(stderr, "  LOG-FATAL             call libbase LOG(FATAL)\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "  SIGFPE                cause a SIGFPE\n");
+    fprintf(stderr, "  SIGILL                cause a SIGILL\n");
     fprintf(stderr, "  SIGSEGV               cause a SIGSEGV at address 0x0 (synonym: crash)\n");
     fprintf(stderr, "  SIGSEGV-non-null      cause a SIGSEGV at a non-zero address\n");
     fprintf(stderr, "  SIGSEGV-unmapped      mmap/munmap a region of memory and then attempt to access it\n");
@@ -207,7 +233,7 @@ noinline int do_action(const char* arg) {
     // Prefixes.
     if (!strncmp(arg, "wait-", strlen("wait-"))) {
       char buf[1];
-      TEMP_FAILURE_RETRY(read(STDIN_FILENO, buf, sizeof(buf)));
+      UNUSED(TEMP_FAILURE_RETRY(read(STDIN_FILENO, buf, sizeof(buf))));
       return do_action(arg + strlen("wait-"));
     } else if (!strncmp(arg, "exhaustfd-", strlen("exhaustfd-"))) {
       errno = 0;
@@ -221,58 +247,93 @@ noinline int do_action(const char* arg) {
 
     // Actions.
     if (!strcasecmp(arg, "SIGSEGV-non-null")) {
-        sigsegv_non_null();
+      sigsegv_non_null();
     } else if (!strcasecmp(arg, "smash-stack")) {
-        volatile int len = 128;
-        return smash_stack(&len);
+      volatile int len = 128;
+      return smash_stack(&len);
     } else if (!strcasecmp(arg, "stack-overflow")) {
-        overflow_stack(nullptr);
+      overflow_stack(nullptr);
     } else if (!strcasecmp(arg, "nostack")) {
-        crashnostack();
+      crashnostack();
     } else if (!strcasecmp(arg, "exit")) {
-        exit(1);
+      exit(1);
+    } else if (!strcasecmp(arg, "call-null")) {
+      return crash_null();
     } else if (!strcasecmp(arg, "crash") || !strcmp(arg, "SIGSEGV")) {
-        return crash(42);
+      return crash(42);
     } else if (!strcasecmp(arg, "abort")) {
-        maybe_abort();
+      maybe_abort();
+    } else if (!strcasecmp(arg, "abort_with_msg")) {
+      android_set_abort_message("Aborting due to crasher");
+      maybe_abort();
+    } else if (!strcasecmp(arg, "abort_with_null")) {
+      android_set_abort_message(nullptr);
+      maybe_abort();
     } else if (!strcasecmp(arg, "assert")) {
-        __assert("some_file.c", 123, "false");
+      __assert("some_file.c", 123, "false");
     } else if (!strcasecmp(arg, "assert2")) {
-        __assert2("some_file.c", 123, "some_function", "false");
+      __assert2("some_file.c", 123, "some_function", "false");
+#if !defined(__clang_analyzer__)
     } else if (!strcasecmp(arg, "fortify")) {
-        char buf[10];
-        __read_chk(-1, buf, 32, 10);
-        while (true) pause();
+      // FORTIFY is disabled when running clang-tidy and other tools, so this
+      // shouldn't depend on internal implementation details of it.
+      char buf[10];
+      __read_chk(-1, buf, 32, 10);
+      while (true) pause();
+#endif
+    } else if (!strcasecmp(arg, "fdsan_file")) {
+      FILE* f = fopen("/dev/null", "r");
+      close(fileno(f));
+    } else if (!strcasecmp(arg, "fdsan_dir")) {
+      DIR* d = opendir("/dev/");
+      close(dirfd(d));
     } else if (!strcasecmp(arg, "LOG(FATAL)")) {
-        LOG(FATAL) << "hello " << 123;
+      LOG(FATAL) << "hello " << 123;
     } else if (!strcasecmp(arg, "LOG_ALWAYS_FATAL")) {
-        LOG_ALWAYS_FATAL("hello %s", "world");
+      LOG_ALWAYS_FATAL("hello %s", "world");
     } else if (!strcasecmp(arg, "LOG_ALWAYS_FATAL_IF")) {
-        LOG_ALWAYS_FATAL_IF(true, "hello %s", "world");
+      LOG_ALWAYS_FATAL_IF(true, "hello %s", "world");
     } else if (!strcasecmp(arg, "SIGFPE")) {
-        raise(SIGFPE);
-        return EXIT_SUCCESS;
+      raise(SIGFPE);
+      return EXIT_SUCCESS;
+    } else if (!strcasecmp(arg, "SIGILL")) {
+#if defined(__aarch64__)
+      __asm__ volatile(".word 0\n");
+#elif defined(__arm__)
+      __asm__ volatile(".word 0xe7f0def0\n");
+#elif defined(__i386__) || defined(__x86_64__)
+      __asm__ volatile("ud2\n");
+#else
+#error
+#endif
     } else if (!strcasecmp(arg, "SIGTRAP")) {
-        raise(SIGTRAP);
-        return EXIT_SUCCESS;
+      raise(SIGTRAP);
+      return EXIT_SUCCESS;
     } else if (!strcasecmp(arg, "fprintf-NULL")) {
-        fprintf_null();
+      fprintf_null();
     } else if (!strcasecmp(arg, "readdir-NULL")) {
-        readdir_null();
+      readdir_null();
     } else if (!strcasecmp(arg, "strlen-NULL")) {
-        return strlen_null();
+      return strlen_null();
     } else if (!strcasecmp(arg, "pthread_join-NULL")) {
-        return pthread_join(0, nullptr);
+      return pthread_join(0, nullptr);
     } else if (!strcasecmp(arg, "heap-usage")) {
-        abuse_heap();
+      abuse_heap();
+    } else if (!strcasecmp(arg, "leak")) {
+      leak();
     } else if (!strcasecmp(arg, "SIGSEGV-unmapped")) {
-        char* map = reinterpret_cast<char*>(mmap(nullptr, sizeof(int), PROT_READ | PROT_WRITE,
-                                                 MAP_SHARED | MAP_ANONYMOUS, -1, 0));
-        munmap(map, sizeof(int));
-        map[0] = '8';
+      char* map = reinterpret_cast<char*>(
+          mmap(nullptr, sizeof(int), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0));
+      munmap(map, sizeof(int));
+      map[0] = '8';
     } else if (!strcasecmp(arg, "seccomp")) {
-        set_seccomp_filter();
-        syscall(99999);
+      set_system_seccomp_filter();
+      syscall(99999);
+#if defined(__LP64__)
+    } else if (!strcasecmp(arg, "xom")) {
+      // Try to read part of our code, which will fail if XOM is active.
+      printf("*%lx = %lx\n", reinterpret_cast<long>(usage), *reinterpret_cast<long*>(usage));
+#endif
 #if defined(__arm__)
     } else if (!strcasecmp(arg, "kuser_helper_version")) {
         return __kuser_helper_version;
@@ -302,7 +363,7 @@ noinline int do_action(const char* arg) {
 int main(int argc, char** argv) {
 #if defined(STATIC_CRASHER)
     debuggerd_callbacks_t callbacks = {
-      .get_abort_message = []() {
+      .get_process_info = []() {
         static struct {
           size_t size;
           char msg[32];
@@ -310,7 +371,9 @@ int main(int argc, char** argv) {
 
         msg.size = strlen("dummy abort message");
         memcpy(msg.msg, "dummy abort message", strlen("dummy abort message"));
-        return reinterpret_cast<abort_msg_t*>(&msg);
+        return debugger_process_info{
+            .abort_msg = reinterpret_cast<void*>(&msg),
+        };
       },
       .post_dump = nullptr
     };

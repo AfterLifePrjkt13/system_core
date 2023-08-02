@@ -21,6 +21,7 @@
 #include <sys/types.h>
 
 #include <algorithm>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -28,10 +29,16 @@
 #include <selinux/label.h>
 
 #include "uevent.h"
+#include "uevent_handler.h"
+
+namespace android {
+namespace init {
 
 class Permissions {
   public:
-    Permissions(const std::string& name, mode_t perm, uid_t uid, gid_t gid);
+    friend void TestPermissions(const Permissions& expected, const Permissions& test);
+
+    Permissions(const std::string& name, mode_t perm, uid_t uid, gid_t gid, bool no_fnm_pathname);
 
     bool Match(const std::string& path) const;
 
@@ -49,13 +56,16 @@ class Permissions {
     gid_t gid_;
     bool prefix_;
     bool wildcard_;
+    bool no_fnm_pathname_;
 };
 
 class SysfsPermissions : public Permissions {
   public:
+    friend void TestSysfsPermissions(const SysfsPermissions& expected, const SysfsPermissions& test);
+
     SysfsPermissions(const std::string& name, const std::string& attribute, mode_t perm, uid_t uid,
-                     gid_t gid)
-        : Permissions(name, perm, uid, gid), attribute_(attribute) {}
+                     gid_t gid, bool no_fnm_pathname)
+        : Permissions(name, perm, uid, gid, no_fnm_pathname), attribute_(attribute) {}
 
     bool MatchWithSubsystem(const std::string& path, const std::string& subsystem) const;
     void SetPermissions(const std::string& path) const;
@@ -67,15 +77,24 @@ class SysfsPermissions : public Permissions {
 class Subsystem {
   public:
     friend class SubsystemParser;
+    friend void TestSubsystems(const Subsystem& expected, const Subsystem& test);
+
+    enum DevnameSource {
+        DEVNAME_UEVENT_DEVNAME,
+        DEVNAME_UEVENT_DEVPATH,
+    };
 
     Subsystem() {}
+    Subsystem(std::string name) : name_(std::move(name)) {}
+    Subsystem(std::string name, DevnameSource source, std::string dir_name)
+        : name_(std::move(name)), devname_source_(source), dir_name_(std::move(dir_name)) {}
 
     // Returns the full path for a uevent of a device that is a member of this subsystem,
     // according to the rules parsed from ueventd.rc
     std::string ParseDevPath(const Uevent& uevent) const {
-        std::string devname = devname_source_ == DevnameSource::DEVNAME_UEVENT_DEVNAME
-                                  ? uevent.device_name
-                                  : android::base::Basename(uevent.path);
+        std::string devname = devname_source_ == DEVNAME_UEVENT_DEVNAME
+                                      ? uevent.device_name
+                                      : android::base::Basename(uevent.path);
 
         return dir_name_ + "/" + devname;
     }
@@ -83,64 +102,55 @@ class Subsystem {
     bool operator==(const std::string& string_name) const { return name_ == string_name; }
 
   private:
-    enum class DevnameSource {
-        DEVNAME_UEVENT_DEVNAME,
-        DEVNAME_UEVENT_DEVPATH,
-    };
-
     std::string name_;
+    DevnameSource devname_source_ = DEVNAME_UEVENT_DEVNAME;
     std::string dir_name_ = "/dev";
-    DevnameSource devname_source_;
 };
 
-class PlatformDeviceList {
-  public:
-    void Add(const std::string& path) { platform_devices_.emplace_back(path); }
-    void Remove(const std::string& path) {
-        auto it = std::find(platform_devices_.begin(), platform_devices_.end(), path);
-        if (it != platform_devices_.end()) platform_devices_.erase(it);
-    }
-    bool Find(const std::string& path, std::string* out_path) const;
-    auto size() const { return platform_devices_.size(); }
-
-  private:
-    std::vector<std::string> platform_devices_;
-};
-
-class DeviceHandler {
+class DeviceHandler : public UeventHandler {
   public:
     friend class DeviceHandlerTester;
 
     DeviceHandler();
     DeviceHandler(std::vector<Permissions> dev_permissions,
-                  std::vector<SysfsPermissions> sysfs_permissions,
-                  std::vector<Subsystem> subsystems);
-    ~DeviceHandler(){};
+                  std::vector<SysfsPermissions> sysfs_permissions, std::vector<Subsystem> subsystems,
+                  std::set<std::string> boot_devices, bool skip_restorecon);
+    virtual ~DeviceHandler() = default;
 
-    void HandleDeviceEvent(const Uevent& uevent);
+    void HandleUevent(const Uevent& uevent) override;
+    void ColdbootDone() override;
+
     std::vector<std::string> GetBlockDeviceSymlinks(const Uevent& uevent) const;
 
+    // `androidboot.partition_map` allows associating a partition name for a raw block device
+    // through a comma separated and semicolon deliminated list. For example,
+    // `androidboot.partition_map=vdb,metadata;vdc,userdata` maps `vdb` to `metadata` and `vdc` to
+    // `userdata`.
+    static std::string GetPartitionNameForDevice(const std::string& device);
+
   private:
-    void FixupSysPermissions(const std::string& upath, const std::string& subsystem) const;
+    bool FindPlatformDevice(std::string path, std::string* platform_device_path) const;
     std::tuple<mode_t, uid_t, gid_t> GetDevicePermissions(
         const std::string& path, const std::vector<std::string>& links) const;
-    void MakeDevice(const std::string& path, int block, int major, int minor,
+    void MakeDevice(const std::string& path, bool block, int major, int minor,
                     const std::vector<std::string>& links) const;
-    std::vector<std::string> GetCharacterDeviceSymlinks(const Uevent& uevent) const;
-    void HandleDevice(const std::string& action, const std::string& devpath, int block, int major,
+    void HandleDevice(const std::string& action, const std::string& devpath, bool block, int major,
                       int minor, const std::vector<std::string>& links) const;
-    void HandlePlatformDeviceEvent(const Uevent& uevent);
-    void HandleBlockDeviceEvent(const Uevent& uevent) const;
-    void HandleGenericDeviceEvent(const Uevent& uevent) const;
+    void FixupSysPermissions(const std::string& upath, const std::string& subsystem) const;
+    void HandleAshmemUevent(const Uevent& uevent);
 
     std::vector<Permissions> dev_permissions_;
     std::vector<SysfsPermissions> sysfs_permissions_;
     std::vector<Subsystem> subsystems_;
-    PlatformDeviceList platform_devices_;
-    selabel_handle* sehandle_;
+    std::set<std::string> boot_devices_;
+    bool skip_restorecon_;
+    std::string sysfs_mount_point_;
 };
 
 // Exposed for testing
 void SanitizePartitionName(std::string* string);
+
+}  // namespace init
+}  // namespace android
 
 #endif
